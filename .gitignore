@@ -1,5 +1,5 @@
 .vscode/
 .claude/
-.png
-.jpg
-.txt
+*.png
+*.jpg
+*.txt
