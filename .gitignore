@@ -1,6 +1,8 @@
 .vscode/
 .claude/
+crop*/
+*.pt
 *.png
 *.jpg
-*.txt
-crop_imgs*/
+output*/
+data/

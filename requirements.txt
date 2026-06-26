@@ -1,0 +1,18 @@
+# Install PyTorch separately first (CUDA 11.8):
+#   pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+transformers>=4.40.0
+Pillow>=10.0.0
+matplotlib>=3.8.0
+numpy>=1.24.0
+questionary>=2.0.0
+imagehash
+scikit-learn>=1.4.0
+ultralytics
+sam2
+ensemble-boxes
+opencv-python
+tqdm
+gradio>=6.19.0
