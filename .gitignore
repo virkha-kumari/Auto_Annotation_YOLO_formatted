@@ -4,5 +4,7 @@ crop*/
 *.pt
 *.png
 *.jpg
+!docs/images/*.jpg
+!docs/images/*.png
 output*/
 data/
