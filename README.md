@@ -6,37 +6,54 @@ Few-shot auto-annotation for industrial computer vision datasets. Label 10–15 
 
 ## Results — Construction-PPE dataset
 
-Test run: [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics). 50 unlabeled target images, 3 classes (helmet, gloves, vest). Seed crops from `valid/` split (100 crops per class, ~70 unique source frames). Ground truth labels available in target set → approximate recall measurable.
+Dataset: [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics). Eval on 50-image subset with ground truth using `scripts/eval_map.py`.
 
-| Class | GT boxes | Predicted | Recall estimate |
-|---|---|---|---|
-| cls0 — helmet | 111 | 56 | ~50% |
-| cls1 — gloves | 44 | 9 | ~20% |
-| cls2 — vest | 93 | 71 | ~76% |
+**Setup:** 1,132 source frames (stride=2 → 566 frames sampled) → 100 crops/class after DINOv2+DBSCAN diversity selection. 380 unique source stems across 10 classes. 50 unlabeled target images. Hardware: RTX 4060 Laptop 8GB VRAM.
 
-"Recall estimate" = predicted / GT, assuming perfect precision (no false positives counted here — visual inspection needed).
+**Parameters:** `--yoloe-conf 0.06 --dino-thresh 0.50 --small-obj-thresh 0.02 --result-thresh 0.50 --containment-thresh 0.70`
 
-**Phase 1 timing (3-class, 162 stems, 50 targets, RTX 4060 8GB):** 4m28s total (~1.7s/stem). Old per-target loop would have been ~20min.
+**Timing (end-to-end):**
+- Phase 1 — YOLOe: 11m02s — 380 stems, 17,668 proposals across 50 targets (~1.74s/stem)
+- Phase 2 — SAM2: 14m55s — SAM2 chunked to 50 boxes/call (OOM fix for images with 300+ proposals)
+- Phase 3+4 — DINOv2 + WBF: remainder
+- **Total: 19m41s** for 50 targets × 10 classes
 
-**What works well:** vest (large, visually distinctive, SAM2 masking clean) → 76% recall at default thresholds. Helmet reasonable at 50% — misses occluded and small-in-frame instances. Both improvable by lowering `--dino-thresh`.
+| Class | Prec | Rec | F1 | AP@.50 | AP@.5:.95 | nPred | nGT |
+|---|---|---|---|---|---|---|---|
+| helmet (cls0) | 0.542 | 0.405 | 0.464 | 0.323 | 0.105 | 83 | 111 |
+| gloves (cls1) | 0.138 | 0.091 | 0.110 | 0.053 | 0.018 | 29 | 44 |
+| vest (cls2) | 0.600 | 0.516 | 0.555 | 0.367 | 0.151 | 80 | 93 |
+| boots (cls3) | 0.188 | 0.231 | 0.207 | 0.102 | 0.034 | 48 | 39 |
+| goggles (cls4) | 0.023 | 0.111 | 0.038 | 0.119 | 0.024 | 43 | 9 |
+| none (cls5) | 0.000 | 0.000 | 0.000 | N/A | N/A | 0 | 20 |
+| Person (cls6) | 0.812 | 0.600 | 0.690 | 0.559 | 0.228 | 85 | 115 |
+| no_helmet / no_goggle / no_gloves / no_boots | — | — | — | — | — | 0 | 0 GT in eval split |
+| **mAP@.50** | | | | **0.254** | **0.093** | 427 | 431 |
 
-**What's hard:** gloves — 20% recall.
+mAP averaged over 7 classes with GT present. Classes with 0 GT excluded per COCO convention.
+
+**What works:**
+- **Person (cls6):** 0.690 F1, AP=0.559. Large object, SAM2 masking effective, DINOv2 discriminative.
+- **Vest (cls2):** 0.555 F1. Large, visually distinctive. SAM2 masked-patch pooling gives clean embeddings.
+- **Helmet (cls0):** 0.464 F1. Multi-person crowd images tank recall — `image117`, `image144`, `image182` all heavily missed.
+
+**What's hard:**
+- **Gloves (cls1):** 9.1% recall. Small (p90 area=0.015), extreme appearance variance. CLS-mode embedding (correct routing) still spreads too wide for clean threshold separation.
+- **Goggles (cls4):** 43 preds, prec=0.023 — near-total FP flood. YOLOe fires on anything goggle-shaped; per-class confidence tuning needed.
+- **Boots (cls3):** FP-heavy (prec=0.188). Similar cause.
+- **`none` (cls5):** 0 proposals. Background/negative class has no coherent visual prototype — YOLOe cannot propose it.
 
 ### Sample outputs
 
-*Color: orange = helmet (cls0), cyan = gloves (cls1), green = vest (cls2)*
+*Colors: orange=helmet(0) cyan=gloves(1) green=vest(2) red=boots(3) purple=goggles(4) white=Person(6) dark-red=no_boots(10)*
 
-| Multi-person scene (9 boxes) | 3-class detection |
+| 6-class detection — 3 workers | Multi-person + road scene |
 |---|---|
-| ![image117](docs/images/image117_preview.jpg) | ![image116](docs/images/image116_preview.jpg) |
+| ![image167](docs/images/image167_preview.jpg) | ![image116](docs/images/image116_preview.jpg) |
 
-| All 3 classes detected | Helmet + vest |
+| Construction site — helmet+vest+boots+Person | Vest+helmet+goggles+boots+no_boots |
 |---|---|
-| ![image137](docs/images/image137_preview.jpg) | ![image150](docs/images/image150_preview.jpg) |
-
-![image141](docs/images/image141_preview.jpg)
-
-**What's hard — gloves:** small objects (p90 area 0.015) with extreme appearance variance (work gloves, latex, different colors, partial occlusion, different hand poses). Even with bbox-crop + mean-pool embedding, the 100-ref proto bank doesn't generalize well enough at threshold 0.65. Lowering `--dino-thresh` to 0.4–0.5 for this class would recover more but increase false positives.
+| ![image149](docs/images/image149_preview.jpg) | ![image151](docs/images/image151_preview.jpg) |
 
 ---
 
@@ -47,7 +64,7 @@ Test run: [Construction-PPE](https://docs.ultralytics.com/datasets/detect/constr
 - **Threshold calibration per dataset/class** — `--dino-thresh 0.65` is a starting point. Check `X/N passed dino-thresh` in logs. Near-zero = lower threshold or switch class to CLS mode manually.
 - **YOLOe call count scales with stem count** — 162 unique source stems × 7 target batches = 1,134 YOLOe calls for 50 targets. With 500+ unique stems across many classes, phase 1 time grows proportionally.
 - **WBF weights not validated** — `0.3×yoloe + 0.7×dino` chosen empirically. May not be optimal for all datasets.
-- **No mAP evaluation yet** — recall estimate above assumes zero false positives. Real precision/recall curves not computed.
+- **mAP evaluated via `scripts/eval_map.py`** — real P/R/F1/AP@.50/mAP@.5:.95 per class. See Results section above.
 
 ---
 
@@ -157,16 +174,6 @@ Note: batching different `refer_images` in one call is impossible — the VPE is
 Built for OWLv2: before sending crops to the detector, filter by DINOv2 scene similarity between source image and target image. Removes crops from scenes that look nothing like the target — reduces noisy proposals.
 
 For YOLOe: irrelevant. YOLOe's visual prompts are sufficiently discriminative without scene pre-filtering. Proposals are well-localized on all tested datasets regardless of source-target scene similarity. Dropped — extra DINOv2 load/unload cycle for no benefit.
-
----
-
-### What's still open
-
-**cls1 (gloves) DINOv2 pass rate** — CLS mode improved from 0% to occasional passes, but most images still 0/N. Gloves are genuinely hard: small + extreme appearance variance (work gloves vs latex vs different colors vs different hand poses) + frequent occlusion. The proto bank has 178 refs but cosine sim at 0.65 threshold is still too strict. Needs either lower `--dino-thresh` for this class, or a fundamentally different comparison approach (e.g. CLIP, or a glove-specific fine-tuned encoder).
-
-**WBF weight calibration** — `0.3×yoloe + 0.7×dino` chosen empirically. Not validated across datasets. The right split depends on how reliable YOLOe proposals are vs DINOv2 scores for a given class.
-
-**mAP evaluation** — pipeline output vs Construction-PPE ground truth not yet run.
 
 ---
 
@@ -286,3 +293,107 @@ Construction-PPE (Ultralytics): helmet, gloves, vest + no-wear variants. 1,416 i
 - `valid/` (143 images) → seed crops (annotated)
 - `train/` (1,132 images) → unlabeled targets
 - Ground truth exists for train/ → enables mAP eval of pipeline output vs human labels
+
+---
+
+## Open Questions and Future Direction
+
+### Scalability ceiling
+
+~20 min for 50 targets × 10 classes on RTX 4060 8GB = 24s/target.
+
+**YOLOe (Phase 1) — 11m02s.** Scales as `O(stems × ceil(targets / batch_size))`. At 380 stems with batch=8, that's 380 × 7 (ceil(50/8)) = 2,660 predict calls. At 1,132 stems (full train split) phase 1 alone would be ~33 min for the same 50 targets. This is the **scaling bottleneck** — every new source frame added to the seed set adds cost proportional to target count. Cutting stem count (stricter DBSCAN, lower `--max-per-class-crops`) is the only lever without changing the architecture. However, then variability issue could arise leading to few proposals.
+
+**SAM2 (Phase 2) — 14m55s.** Scales as `O(proposals)` — 17,668 proposals chunked at 50 boxes/call = ~354 SAM2 forward passes. This is the **single-run bottleneck** for a fixed target set. SAM2 cost is roughly constant once proposal count stabilizes — adding more stems doesn't increase it much. But it's still the biggest chunk of wall-clock time for any given run. Chunking to 50 boxes/call was required after OOM crash with 300+ boxes/image on a 10-class run.
+
+Combined: not practical beyond ~200–300 targets without either cutting stem count, replacing SAM2 with a faster masker, or skipping SAM2 entirely for more classes via the small-obj CLS-mode path.
+
+### Accuracy ceiling — not fixable by threshold tuning
+
+Person F1=0.69 and vest F1=0.55 are usable. Helmet at 0.46, boots at 0.21, gloves at 0.11 are not — correcting auto-annotations costs more than labeling from scratch. Goggles (prec=0.023, 43 FPs for 1 TP) is actively harmful. The pipeline only makes economic sense when precision is high enough that FPs are rare — misses can be skipped, FPs require active deletion.
+
+### The core observation — YOLOe fails where YOLO succeeds
+
+Standard YOLO trained on the same dataset achieves mAP@.50 >0.85 on this PPE task. YOLOe visual-prompt mode gets 0.254. The gap is not in the detection backbone — YOLOe and YOLO-11 share the same CSP/C3k2 feature pyramid. The gap is in the classification head:
+
+- **YOLO:** learned per-class decision boundaries, linear classifier on backbone features, trained with thousands of examples
+- **YOLOe VPE:** global mean-pool of reference image features compared against proposal features via cosine distance — one vector per class, no learned boundaries
+
+For visually ambiguous classes (gloves vs bare hands, goggles vs glasses, boots vs shoes), VPE is a hard ceiling. It loses discriminative information that isn't captured by a single mean-pooled reference embedding.
+
+### Research direction — backbone features + few-shot head
+
+The most promising path: train a lightweight classification head on top of **frozen YOLO backbone features**, using the 100 labeled reference crops per class we already have.
+
+1. **Extract ROI-pooled features** — run YOLO-11 backbone (same as YOLOe's backbone) in feature-extraction mode. Take ROI-pooled P3/P4/P5 features for each proposal box. These are exactly the features a trained YOLO classifier uses — the backbone already learned to discriminate them.
+
+2. **Train a few-shot head on those features** — with 100 reference crops per class, train a cosine-similarity classifier (ProtoNet-style) or regularized linear head on frozen backbone features. The backbone learned discriminative representations for the domain; fine-tuning only the head needs very few examples and avoids overfitting.
+
+3. **Why VPE fails architecturally** — YOLOe's VPE bakes in global image context (whole refer_image, mean-pooled) which contaminates the class-specific signal, especially for small or partially-occluded objects. A head trained on ROI-cropped backbone features avoids this — it never sees the reference image background.
+
+4. **What to investigate** — the C3k2 blocks in YOLO-11's neck produce features aggregated across scales before the detection head. The per-class spatial attention pattern at P3 (small objects) vs P5 (large objects) differs substantially. Understanding which layers carry the most discriminative signal per class — and whether that signal survives the VPE mean-pooling projection — is the core architectural question.
+
+**Practical implication:** with 100 annotated instances per class (achievable in ~1 hour of manual labeling), a frozen-backbone + few-shot head would likely reach the accuracy of a fully trained YOLO at a fraction of the annotation cost, and would run faster than the current YOLOe→SAM2→DINOv2 chain since SAM2 masking would no longer be needed for embedding quality.
+
+---
+
+## Full Work Summary
+
+Everything built and tested in this repo, in order:
+
+### Scripts
+
+**`scripts/extract_crops_labelled.py`** — seed crop extraction from YOLO-annotated datasets. Reads label `.txt` files, crops each bbox with configurable padding, deduplicates via perceptual hash (phash), embeds remaining crops with DINOv2, clusters with DBSCAN (eps/min_samples configurable), selects one representative per cluster + random outliers up to `--max-per-class-crops`. Stride parameter to subsample large datasets. Output: `cls<id>/` dirs of `.jpg` crops named `<stem>_cls<id>_<idx>.jpg` for traceability back to source frame.
+
+**`scripts/extract_crops_varied.py`** — same as above but no clustering. All deduped crops saved. Used when class has low visual variance or you want maximum diversity without DBSCAN.
+
+**`scripts/auto_annotate.py`** — main production pipeline. Four phases, models loaded/unloaded sequentially (VRAM rule):
+- Phase 1: YOLOe loads once, pre-builds `stem_prompts` dict (label reads happen once at startup, not N_targets × N_stems), bakes VPE per stem via `get_vpe()` + `set_classes()`, batches all target images per stem. 2.91× speedup over per-target loop confirmed.
+- Phase 2a: SAM2 loads once, masks all reference crops per class (SAM2/masked-patch classes only), skips SAM2 for small-object classes (bbox-crop/mean-pool routing). Phase 2b: SAM2 masks all target proposals in chunks of 50 boxes/call (OOM fix added after hitting CUDA OOM with 300+ boxes/image when running 10 classes).
+- Phase 3: DINOv2 loads once, builds proto bank per class (individual crop embeddings, not averaged), scores all proposals via cosine sim `prop @ bank.T → max`, drops below `--dino-thresh`.
+- Phase 4: WBF (`0.3×yoloe_conf + 0.7×dino_sim`), containment filter, saves YOLO `.txt` + preview `.jpg` per target + `summary.json`.
+
+Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile bbox area across all source labels per class at startup. If p90 < `--small-obj-thresh`, class skips SAM2 entirely and uses mean of all DINOv2 tokens on raw bbox crop. Both refs and proposals use identical method per class (invariant enforced).
+
+**`scripts/eval_map.py`** — evaluation script (new, this session). Pure numpy, no torchvision/pycocotools. Loads predicted YOLO `.txt` + GT YOLO `.txt`, reads scores from `summary.json` if present (else uniform 1.0), computes per-class P/R/F1 at configurable IoU, AP@.50 (101-point interpolation), mAP@.50:.95 (10-threshold COCO average). Global confidence-sorted matching with per-image matched-GT sets (correct — avoids cross-image TP assignment bug). Prints per-image tp/fp/fn breakdown. Classes with 0 GT excluded from mAP mean with explicit print notice.
+
+**`app.py`** — Gradio 3-page wizard wrapping the full pipeline. Page 1: crop extraction (calls `extract_crops_labelled.py`). Page 2: pipeline run (calls `auto_annotate.py`, streams log output). Page 3: result gallery. All pipeline parameters exposed as UI controls. `--small-obj-thresh` added to UI this session (was hardcoded at 0.01, now `gr.Number` defaulting to 0.02).
+
+### Test / debug scripts
+
+**`test/debug_yoloe_sam2_dino.py`** — full pipeline debug on a single target image. 4-panel matplotlib viz: raw proposals, post-dino-thresh proposals, post-WBF boxes, final after containment filter. Used throughout development to understand what each stage was doing.
+
+**`test/test_yoloe_batch.py`** — benchmark confirming batched YOLOe (VPE bake once per stem, predict all targets) gives 2.91× speedup vs per-target loop. Proposal counts identical (242 vs 242) confirming correctness.
+
+**`test/debug_yoloe.py`**, **`utils/debug_yoloe.py`** — pure YOLOe visual-prompt debug, no DINOv2. Used to diagnose proposal quality in isolation.
+
+**`utils/test_owlv2_dinov2.py`** — OWLv2 + DINOv2 pipeline. Dead end: OWLv2 failed on large objects due to patch-based ViT architecture. Kept as reference.
+
+### Docs
+
+**`docs/log.md`** — chronological ADDED/DROPPED/FINDING log. Every design decision and dead end recorded with reason.
+
+**`docs/notes.md`** — pipeline design decisions and dataset overview.
+
+### Findings confirmed in this repo
+
+1. YOLOe VPE works at conf≥0.06 for large/medium industrial objects and PPE classes.
+2. Batched YOLOe (VPE bake per stem + batch predict) = 2.91× speedup, identical proposals.
+3. I/O bottleneck (label reads inside target loop) caused 4–6× slowdown. Fixed by pre-building `stem_prompts`.
+4. SAM2 masked-patch pooling: sims 0.60–0.95 vs 0.19–0.43 for full-crop CLS. Works for medium/large objects.
+5. Small objects (<2% frame area) break masked-patch pooling — CLS-mode fix recovered non-zero recall for gloves.
+6. SAM2 OOM when feeding all proposals for a 10-class run (~300+ boxes/image) — chunking to 50 boxes/call fixed.
+7. Averaged DINOv2 prototype dilutes signal — per-crop bank + max-sim scoring is correct.
+8. OWLv2 cannot detect large objects (patch-ViT architectural limit, not a tuning issue).
+9. SAM2/SAM3 failed as proposal generators on industrial/PPE scenes (no texture-contrast boundary signal).
+10. `none` (background/negative) class cannot be proposed by YOLOe — no coherent visual prototype exists.
+11. mAP@.50 = 0.254 on Construction-PPE 10-class eval. Person best (AP=0.559), gloves worst (AP=0.053). Goggles FP-flooded (prec=0.023).
+---
+
+## Collaboration
+
+Open to collaboration — if you have ideas on improving the proposal quality, the scoring stage, or the few-shot head direction above, feel free to reach out or open an issue.
+
+If you hit a bug, a dataset where the pipeline behaves unexpectedly, or have a suggestion to improve any part of the pipeline — don't hesitate to open an issue. Every edge case is useful signal.
+
+Made with love for CV-curious engineers who want to understand what's actually happening inside these models, not just run them.

@@ -399,18 +399,21 @@ def run_phase2b_sam2_proposals(
     for i, (box, conf, cls_idx, stem) in small_props:
         result_map[i] = (box, conf, cls_idx, make_bbox_crop(target_np, np.array(box)), stem)
 
-    # normal objects — batch SAM2
+    # normal objects — SAM2 in chunks to avoid OOM on images with many proposals
+    SAM2_BOX_CHUNK = 50
     if normal_props:
         predictor.set_image(target_np)
-        boxes_np = np.array([p[0] for _, p in normal_props], dtype=np.float32)
-        raw_masks, scores, _ = predictor.predict(box=boxes_np, multimask_output=True)
         skipped = 0
-        for k, (i, (box, conf, cls_idx, stem)) in enumerate(normal_props):
-            best_idx = int(np.argmax(scores[k]))
-            mask     = raw_masks[k, best_idx].astype(np.uint8)
-            if mask.sum() == 0:
-                skipped += 1; continue
-            result_map[i] = (box, conf, cls_idx, make_masked_crop(target_np, mask, np.array(box)), stem)
+        for chunk_start in range(0, len(normal_props), SAM2_BOX_CHUNK):
+            chunk = normal_props[chunk_start:chunk_start + SAM2_BOX_CHUNK]
+            boxes_np = np.array([p[0] for _, p in chunk], dtype=np.float32)
+            raw_masks, scores, _ = predictor.predict(box=boxes_np, multimask_output=True)
+            for k, (i, (box, conf, cls_idx, stem)) in enumerate(chunk):
+                best_idx = int(np.argmax(scores[k]))
+                mask     = raw_masks[k, best_idx].astype(np.uint8)
+                if mask.sum() == 0:
+                    skipped += 1; continue
+                result_map[i] = (box, conf, cls_idx, make_masked_crop(target_np, mask, np.array(box)), stem)
         kept_normal = len(normal_props) - skipped
         print(f"[phase2b] normal: {kept_normal}/{len(normal_props)} kept | small: {len(small_props)} bbox-crop")
     else:

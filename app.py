@@ -188,7 +188,7 @@ def run_pipeline(
     yoloe_conf, nms_iou, wbf_score,
     dino_thresh, result_panel3_thresh, final_containment_thresh,
     sam2_mask_padding, sam_score_min, sam_area_min,
-    dino_batch_size, yoloe_batch_size, output_dir,
+    dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir,
 ):
     if not targets_dir or not Path(targets_dir).is_dir():
         yield "❌ Targets dir not found.", gr.update(interactive=False), []
@@ -256,7 +256,7 @@ def run_pipeline(
         "--sam-area-min",       str(sam_area_min),
         "--dino-batch-size",    str(dino_batch_size),
         "--yoloe-batch-size",   str(int(yoloe_batch_size)),
-        "--small-obj-thresh",   "0.01",
+        "--small-obj-thresh",   str(small_obj_thresh),
     ]
 
     full_log += f"[cmd] {' '.join(cmd)}\n"
@@ -525,6 +525,9 @@ def build_app():
                 dino_batch_size = gr.Slider(4, 64, value=16, step=4,
                     label="DINOv2 batch size",
                     info="Embedding batch size. Reduce if VRAM OOM during DINOv2 phase.")
+                small_obj_thresh = gr.Number(value=0.02, precision=4,
+                    label="Small object threshold",
+                    info="Classes with p90 bbox area (w×h normalised) below this use CLS-token embedding instead of masked-patch pooling. Raise for tiny classes like gloves.")
 
             gr.Markdown("### WBF + filtering")
             with gr.Row():
@@ -685,7 +688,7 @@ def build_app():
                 yoloe_conf, nms_iou, wbf_score,
                 dino_thresh, result_panel3_thresh, final_containment_thresh,
                 sam2_mask_padding, sam_score_min, sam_area_min,
-                dino_batch_size, yoloe_batch_size, output_dir_p2,
+                dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir_p2,
             ],
             outputs=[pipeline_log, next_to_p3, result_images_state],
         )

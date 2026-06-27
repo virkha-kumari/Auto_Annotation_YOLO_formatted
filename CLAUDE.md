@@ -41,12 +41,6 @@ Used across multiple industrial computer vision projects.
 - **`scripts/auto_annotate.py`** — BUILT AND WORKING. Multi-class, batched, small-obj-aware.
 - **`app.py`** — Gradio 3-page wizard wrapping the full pipeline. WORKING.
 
-### NOT DECIDED (under active experimentation)
-
-- **Threshold calibration** — `--dino-thresh` (0.65), `--wbf-score` (0.10), `--result-thresh` (0.5), `--containment-thresh` (0.70), `--small-obj-thresh` (0.02) all need per-dataset tuning.
-- **WBF score weights** — `0.3/0.7` split chosen, not yet validated across datasets.
-- **mAP evaluation** — pipeline output vs ground truth on Construction-PPE train/ not yet run.
-
 ---
 
 ## Current scripts
@@ -153,4 +147,3 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - **SAM2/SAM3** fail as proposal generators for large uniform regions
 - **DINOv2 masked-patch pooling** breaks for tiny objects (<2% frame area) — use CLS mode
 - **Threshold calibration** not validated across datasets — tune per project
-- **WBF 0.3/0.7 weights** not validated across datasets
