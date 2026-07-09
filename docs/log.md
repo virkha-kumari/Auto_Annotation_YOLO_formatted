@@ -39,6 +39,37 @@ Replaced the old plain `mask-generation` pipeline (unprompted auto-mask, same de
 
 **Early read:** promising enough to keep refining — first real signal that SAM3 might get closer to a genuine few-shot auto-annotation path (native concept-matching + box exemplar, not YOLOe-visual-prompt-plus-separate-DINOv2-scoring). Still needs: threshold tuning (currently `--threshold`/`--mask-threshold` both loosened to 0.2 for initial visibility), a real accuracy pass across multiple refs/targets (currently qualitative eyeballing only), and a decision on whether canvas-composite overhead (per-pair forward pass, no batching yet) is fast enough to replace or complement YOLOe+SAM2+DINOv2 in `scripts/auto_annotate.py`.
 
+### ADDED — `test/debug_sam3.py`: score + native-box visualization
+
+`post_process_instance_segmentation()` returns `masks`, `boxes`, `scores` — index-aligned, but `boxes`/`scores` were being dropped on the floor. Now:
+- `scores` tracked alongside masks through the crop-to-target filter (zip preserves alignment), printed per (ref, target) pair, drawn as per-box text labels on panels 3+4, panel titles show the score list + max score.
+- `boxes` (SAM3's own box-regression head output, canvas-space, independent of the mask) now drawn on panel 2 (raw canvas prediction) as yellow boxes with score labels — lets you visually compare SAM3's native box prediction against the mask-derived tight bbox used downstream.
+
+**Why this matters:** the mask→bbox path (`mask_to_bbox()` on the cropped/resized mask) and SAM3's own box head can disagree — worth seeing both to judge which is more reliable per case before committing to one for the final auto-annotate integration.
+
+### ADDED — `test/debug_sam3.py`: batched targets-per-ref (speed fix)
+
+Was one `model()` forward pass per (ref, target) pair — fully serial, GPU underutilized between calls (I/O + PIL/matplotlib overhead dominating wall time, not GPU compute). Restructured:
+- Outer loop = ref instances, inner loop = target batches of `--batch-size` (default 4).
+- Per ref: build all target canvases in the batch (still serial CPU/PIL work — canvas composition is index-specific per target), then one `processor(images=[canvas1..canvasN], input_boxes=[[box1],...,[boxN]])` → one `model(**inputs)` call → one `post_process_instance_segmentation()` returning a results list, one entry per canvas.
+- Confirmed via HF `transformers` docs (`Sam3Processor` "Batched Mixed Prompts" example) that this per-image `input_boxes`/`input_boxes_labels` batching shape is exactly right for `Sam3Model`+`Sam3Processor` (not to be confused with `Sam3TrackerProcessor`'s different batching API, which uses a different model/head).
+- `del inputs, outputs` + `torch.cuda.empty_cache()` after each batch — VRAM-safe on 8GB card. `--batch-size` is user-tunable if OOM.
+
+**Why targets-not-refs:** ref's canvas box is identical across all targets in one batch (only the canvas differs, since target placement always has the same fixed slot); batching refs instead would need a different canvas per ref anyway, so target-batching was the natural axis with no correctness cost.
+
+### ADDED — `test/debug_sam3.py`: multi-class support
+
+Was single `--class-id` int, one class per run. Now:
+- `--class-ids` accepts explicit list (`--class-ids 0 1 2`) or defaults to `"all"`, which auto-discovers every class id present across `--refs-labels/*.txt` via `discover_class_ids()`.
+- Ref instances collected per class into `ref_instances_by_class`, main loop iterates `class_id → ref → target_batch`.
+- Ref/output naming tagged `cls<id>_<ref_name>` to disambiguate across classes when the same image contributes refs to multiple classes (allowed — one label file can have multiple class boxes, refs are pulled independently per class, no forced disjoint set).
+
+**Cost model clarified:** total forward-pass count is `O(sum(refs_per_class) × targets)` — the class axis is a hard multiplier, not something batching can remove. Each canvas encodes exactly one ref's box as a single geometric exemplar; SAM3's box-exemplar mode has no per-box class-id channel, so two classes cannot share one canvas/forward-pass without conflating concepts. What *is* still available (not yet done): flattening the ref×class dims into the same batch-chunking as the target axis — same total compute, fewer Python-loop iterations. Left as a later optimization; ref counts are small (15-20/class) so current triple-nested loop overhead is not the bottleneck yet.
+
+### FINDING — output subfolders slowed down manual review; flattened
+
+Original layout was `output_dir/<target_stem>/<ref_tag>.png` — one subfolder per target, hard to browse across many targets/classes/refs at once (had to open each folder individually). Flattened to `output_dir/<target_stem>__<ref_tag>.png` — every result file directly in one directory, sortable/filterable by filename prefix in a normal file browser.
+
 ---
 
 ## 2026-06-26 (session 2)

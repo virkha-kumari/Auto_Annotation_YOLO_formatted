@@ -65,7 +65,7 @@ seed crops: <stem>_cls<id>_<idx>.jpg  (naming enables source reverse-resolution)
 |---|---|---|
 | SAM2 auto mask generation | ❌ Dead end | No proposals on large uniform regions. SAM2 needs texture contrast. |
 | SAM3 auto mask generation (unprompted) | ❌ Dead end | Same as SAM2. |
-| SAM3 canvas-composite few-shot (`test/debug_sam3.py`) | 🔬 Active — promising early | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Early qualitative results promising; needs threshold tuning + real accuracy pass. See `docs/log.md` 2026-07-09. |
+| SAM3 canvas-composite few-shot (`test/debug_sam3.py`) | 🔬 **Active — current best few-shot direction, being refined** | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Now supports: SAM3 native box+score visualization alongside mask-derived tight bbox, batched targets-per-ref forward passes (`--batch-size`, speed fix), multi-class (`--class-ids`, explicit or auto-discover "all"), flat output naming. Early qualitative results promising; needs threshold tuning + real accuracy pass before promotion into `scripts/auto_annotate.py`. See `docs/log.md` 2026-07-09. |
 | OWLv2 image-guided detection | ❌ Dead end | Patch-based ViT — tile-level texture matching. Cannot compose bbox larger than one tile. Tested at 640/1008/1280px. |
 | YOLOe visual-prompt detection | ✅ Confirmed | Multi-scale FPN detects at all scales. Works at conf≥0.06. |
 

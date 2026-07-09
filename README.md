@@ -108,7 +108,9 @@ The first major blocker was finding a model that could propose bounding boxes fr
 
 **SAM2 auto mask generation** — tried first because SAM2 is the dominant segmentation model. Generates thousands of masks per image automatically. Result: zero useful proposals on the target classes (conveyors, car body panels, vests, tools). SAM2 auto-mode works on natural images with strong texture contrast at boundaries. Industrial scenes with large uniform-color objects have no boundary signal for SAM2 to latch onto. Failed completely.
 
-**SAM3** — tried as a replacement. Same architectural premise, same failure mode. Dropped.
+**SAM3 (auto mask generation)** — tried as a replacement. Same architectural premise, same failure mode. Dropped.
+
+*(SAM3 was revisited later via a different mechanism — canvas-composite cross-image exemplar prompting, not auto-mask-generation. See "Inspirations" below and `docs/log.md` 2026-07-09 — actively being refined, currently the most promising few-shot direction under test.)*
 
 **OWLv2 image-guided detection** (`google/owlv2-base-patch16-ensemble`) — seemed promising. Takes query images + target image, returns bounding boxes of similar objects. Tested extensively at 640px, 1008px, 1280px with per-crop pipelines and multi-scale tricks. Result: on a large uniform-color object (~60% of frame), every single proposal was a tiny box at image edges. Best DINOv2 sim on any proposal: 0.699.
 
@@ -393,6 +395,8 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 ## Inspirations
 
 - [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) — canvas-composite technique for cross-image few-shot exemplar prompting with a frozen SAM3 (paste reference + target into one shared canvas, remap the reference bbox into canvas coordinates, prompt SAM3 once, crop the target region back out). SAM3 has no native cross-image exemplar API — image-exemplar boxes only match within the same image they're drawn on — so this composite-canvas trick is what `test/debug_sam3.py` uses to test SAM3's raw few-shot capability against labelled reference instances.
+
+**Status (2026-07-09, active):** `test/debug_sam3.py` is the current best-performing few-shot direction under test — genuine SAM3 concept-matching + geometric box exemplar, not a YOLOe-visual-prompt-plus-bolted-on-DINOv2-scoring workaround. Actively being refined: score + box visualization (SAM3's native box head + confidence, shown alongside mask-derived tight bbox), batched targets-per-ref forward passes for speed, multi-class support (`--class-ids`, explicit list or auto-discover "all"), flat output naming for fast review. Not yet promoted into `scripts/auto_annotate.py` — still qualitative eyeballing, no accuracy pass yet, threshold calibration pending. See `docs/log.md` 2026-07-09 for full history.
 
 ## Collaboration
 

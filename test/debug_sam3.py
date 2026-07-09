@@ -9,16 +9,24 @@ known bbox into canvas-normalized coords, run SAM3 once with that box as a
 positive geometric exemplar (box-only, no text), then crop the target half of
 the prediction back out and resize to the target's original size.
 
-For each (ref instance, target image) pair, saves a 3-panel figure:
+For each (class id, ref instance, target image) triple, saves a 4-panel figure:
   1. Composite canvas (ref top, target bottom) with the ref exemplar box drawn
-  2. Raw SAM3 prediction mask on the full canvas
-  3. Prediction cropped back to target image, overlaid as mask + bbox
+  2. Raw SAM3 prediction on the full canvas, with SAM3's own boxes + scores
+  3. Prediction cropped back to target image, overlaid as mask + bbox + scores
+  4. Tightened bbox only, per instance, with scores
+
+Multi-class: pass --class-ids as explicit ids ("0 1 2") or omit for "all"
+(auto-discovers every class id present in --refs-labels). Output is flat,
+one file per (ref, target) pair: output_dir/<target_stem>__cls<id>_<ref>.png
+
+Targets are batched per ref (--batch-size) into a single SAM3 forward pass
+for speed; lower --batch-size if you hit OOM on 8GB VRAM.
 
 Usage:
     python test/debug_sam3.py \\
         --refs-dir    "D:/path/to/labelled_ref_images" \\
         --refs-labels "D:/path/to/labelled_ref_images"  (YOLO .txt, same stem) \\
-        --class-id    0 \\
+        --class-ids   0 1 2 \\
         --targets-dir "D:/path/to/target_images"
 """
 
@@ -36,6 +44,16 @@ SAM3_MODEL_ID = "facebook/sam3"
 CANVAS_SIZE = 1008
 SPLIT_RATIO = 0.5   # ref gets 50% of canvas, target gets 50%
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def discover_class_ids(refs_labels: Path) -> list[int]:
+    ids = set()
+    for label_path in refs_labels.glob("*.txt"):
+        for line in label_path.read_text().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                ids.add(int(parts[0]))
+    return sorted(ids)
 
 
 def collect_ref_instances(refs_dir: Path, refs_labels: Path, class_id: int) -> list[dict]:
@@ -119,8 +137,9 @@ def mask_to_bbox(mask: np.ndarray) -> list[int] | None:
     return [int(x1), int(y1), int(x2), int(y2)]
 
 
-def save_step_figure(canvas, ref_box_canvas_xyxy, raw_mask_canvas, target_img,
-                      pred_mask_target, pred_boxes_target, ref_name, target_name, output_path):
+def save_step_figure(canvas, ref_box_canvas_xyxy, raw_mask_canvas, raw_boxes_canvas, raw_scores_canvas,
+                      target_img, pred_mask_target, pred_boxes_target, pred_scores_target,
+                      ref_name, target_name, output_path):
     fig, axes = plt.subplots(1, 4, figsize=(32, 8))
 
     axes[0].imshow(canvas)
@@ -132,25 +151,37 @@ def save_step_figure(canvas, ref_box_canvas_xyxy, raw_mask_canvas, target_img,
 
     axes[1].imshow(canvas)
     axes[1].imshow(raw_mask_canvas, alpha=0.5, cmap="jet")
-    axes[1].set_title("Raw SAM3 prediction on full canvas", fontsize=9)
+    for box, score in zip(raw_boxes_canvas, raw_scores_canvas):
+        x1, y1, x2, y2 = box
+        axes[1].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                           linewidth=2, edgecolor="yellow", facecolor="none"))
+        axes[1].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="yellow", fontsize=8,
+                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
+    axes[1].set_title(f"Raw SAM3 prediction on full canvas\n({len(raw_boxes_canvas)} box(es), yellow = SAM3 boxes)", fontsize=9)
     axes[1].axis("off")
 
     axes[2].imshow(target_img)
     if pred_mask_target is not None:
         axes[2].imshow(pred_mask_target, alpha=0.5, cmap="jet")
-    for box in pred_boxes_target:
+    for box, score in zip(pred_boxes_target, pred_scores_target):
         x1, y1, x2, y2 = box
         axes[2].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
                            linewidth=2, edgecolor="cyan", facecolor="none"))
-    axes[2].set_title(f"Cropped back to target\n({len(pred_boxes_target)} instance(s) found)", fontsize=9)
+        axes[2].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="cyan", fontsize=8,
+                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
+    scores_str = ", ".join(f"{s:.2f}" for s in pred_scores_target) or "-"
+    axes[2].set_title(f"Cropped back to target\n({len(pred_boxes_target)} instance(s), scores: {scores_str})", fontsize=9)
     axes[2].axis("off")
 
     axes[3].imshow(target_img)
-    for box in pred_boxes_target:
+    for box, score in zip(pred_boxes_target, pred_scores_target):
         x1, y1, x2, y2 = box
         axes[3].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
                            linewidth=2, edgecolor="orange", facecolor="none"))
-    axes[3].set_title(f"Tightened bbox only, per instance ({len(pred_boxes_target)})", fontsize=9)
+        axes[3].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="orange", fontsize=8,
+                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
+    max_score_str = f"{max(pred_scores_target):.2f}" if pred_scores_target else "-"
+    axes[3].set_title(f"Tightened bbox only, per instance ({len(pred_boxes_target)})\nmax score: {max_score_str}", fontsize=9)
     axes[3].axis("off")
 
     plt.tight_layout()
@@ -163,15 +194,67 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--refs-dir", required=True, help="Folder of full reference images")
     p.add_argument("--refs-labels", required=True, help="Folder of YOLO .txt labels (same stem as ref images)")
-    p.add_argument("--class-id", type=int, required=True, help="Class id to pull ref instances for")
+    p.add_argument("--class-ids", nargs="+", default=["all"],
+                    help="Class ids to pull ref instances for, e.g. '0 1 2'. Default 'all' auto-discovers every class id present in --refs-labels.")
     p.add_argument("--targets-dir", required=True, help="Folder of target images (can include ref images too)")
     p.add_argument("--orientation", choices=["vertical", "horizontal"], default="vertical")
     p.add_argument("--split-ratio", type=float, default=SPLIT_RATIO)
     p.add_argument("--canvas-size", type=int, default=CANVAS_SIZE)
-    p.add_argument("--threshold", type=float, default=0.2)
-    p.add_argument("--mask-threshold", type=float, default=0.2)
+    p.add_argument("--threshold", type=float, default=0.6)
+    p.add_argument("--mask-threshold", type=float, default=0.6)
     p.add_argument("--output-dir", default="output_sam3_fewshot")
+    p.add_argument("--batch-size", type=int, default=4,
+                    help="Targets batched per forward pass (same ref). Lower if OOM on 8GB VRAM.")
     return p.parse_args()
+
+
+def process_result(canvas, placements, ref_box_canvas_xyxy, target_img, masks_canvas,
+                    scores_canvas, boxes_canvas, ref_name, target_name, out_path):
+    ch_cw = placements["canvas_size"]
+    cw, ch = ch_cw
+
+    raw_mask_canvas = np.zeros((ch, cw), dtype=np.uint8)
+    for m in masks_canvas:
+        raw_mask_canvas |= m
+
+    tgt = placements["tgt"]
+    tx, ty = tgt["offset"]
+    tw, th = tgt["curr_size"]
+
+    pred_masks_target = []
+    pred_boxes_target = []
+    pred_scores_target = []
+    for m, score in zip(masks_canvas, scores_canvas):
+        crop = m[ty:ty + th, tx:tx + tw]
+        if not crop.any():
+            continue
+        mask_target = np.array(
+            Image.fromarray(crop * 255).resize(tgt["orig_size"], Image.NEAREST)
+        ) > 0
+        box = mask_to_bbox(mask_target)
+        if box is None:
+            continue
+        pred_masks_target.append(mask_target)
+        pred_boxes_target.append(box)
+        pred_scores_target.append(score)
+
+    if pred_scores_target:
+        scores_log = ", ".join(f"{s:.3f}" for s in pred_scores_target)
+        print(f"  [scores] {len(pred_scores_target)} instance(s): {scores_log}")
+    else:
+        print("  [scores] no instances passed into target region")
+
+    combined_mask_target = None
+    if pred_masks_target:
+        combined_mask_target = np.zeros_like(pred_masks_target[0])
+        for m in pred_masks_target:
+            combined_mask_target |= m
+
+    save_step_figure(
+        canvas, ref_box_canvas_xyxy, raw_mask_canvas, boxes_canvas, scores_canvas,
+        target_img, combined_mask_target, pred_boxes_target, pred_scores_target,
+        ref_name, target_name, out_path,
+    )
 
 
 def main():
@@ -181,10 +264,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device}")
 
-    ref_instances = collect_ref_instances(Path(args.refs_dir), Path(args.refs_labels), args.class_id)
-    print(f"[refs] {len(ref_instances)} ref instance(s) for class {args.class_id}")
-    if not ref_instances:
-        print("[abort] No ref instances found.")
+    refs_labels_dir = Path(args.refs_labels)
+    if args.class_ids == ["all"]:
+        class_ids = discover_class_ids(refs_labels_dir)
+        print(f"[class-ids] auto-discovered: {class_ids}")
+    else:
+        class_ids = [int(c) for c in args.class_ids]
+    if not class_ids:
+        print("[abort] No class ids found.")
+        return
+
+    ref_instances_by_class = {}
+    for class_id in class_ids:
+        instances = collect_ref_instances(Path(args.refs_dir), refs_labels_dir, class_id)
+        print(f"[refs] {len(instances)} ref instance(s) for class {class_id}")
+        if instances:
+            ref_instances_by_class[class_id] = instances
+    if not ref_instances_by_class:
+        print("[abort] No ref instances found for any class.")
         return
 
     targets_dir = Path(args.targets_dir)
@@ -198,81 +295,69 @@ def main():
     model = Sam3Model.from_pretrained(SAM3_MODEL_ID, device_map=device)
     processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
 
-    total = len(ref_instances) * len(target_paths)
+    target_imgs = {p: Image.open(p).convert("RGB") for p in target_paths}
+
+    total = sum(len(insts) for insts in ref_instances_by_class.values()) * len(target_paths)
     done = 0
-    for target_path in target_paths:
-        target_img = Image.open(target_path).convert("RGB")
-        target_out_dir = output_dir / target_path.stem
-        target_out_dir.mkdir(exist_ok=True)
-
+    batch_size = args.batch_size
+    for class_id, ref_instances in ref_instances_by_class.items():
         for ref in ref_instances:
-            done += 1
-            print(f"\n[{done}/{total}] ref={ref['name']}  target={target_path.name}")
+            ref_tag = f"cls{class_id}_{ref['name']}"
+            for batch_start in range(0, len(target_paths), batch_size):
+                batch_paths = target_paths[batch_start:batch_start + batch_size]
+                print(f"\n[class={class_id} ref={ref['name']}] batch {batch_start // batch_size + 1} "
+                      f"({len(batch_paths)} target(s): {', '.join(p.name for p in batch_paths)})")
 
-            canvas, placements = create_canvas(
-                ref["image"], ref["box"], target_img,
-                args.canvas_size, args.orientation, args.split_ratio,
-            )
-            norm_box = get_norm_box(placements)
-            cw, ch = placements["canvas_size"]
-            ref_box_canvas_xyxy = norm_cxcywh_to_xyxy_px(norm_box, cw, ch)
+                canvases, placements_list, ref_box_xyxys = [], [], []
+                for target_path in batch_paths:
+                    canvas, placements = create_canvas(
+                        ref["image"], ref["box"], target_imgs[target_path],
+                        args.canvas_size, args.orientation, args.split_ratio,
+                    )
+                    norm_box = get_norm_box(placements)
+                    cw, ch = placements["canvas_size"]
+                    box_xyxy = norm_cxcywh_to_xyxy_px(norm_box, cw, ch)
+                    canvases.append(canvas)
+                    placements_list.append(placements)
+                    ref_box_xyxys.append(box_xyxy)
 
-            box_xyxy = norm_cxcywh_to_xyxy_px(norm_box, cw, ch)
-            inputs = processor(
-                images=canvas,
-                input_boxes=[[box_xyxy]],
-                input_boxes_labels=[[1]],
-                return_tensors="pt",
-            ).to(model.device)
+                inputs = processor(
+                    images=canvases,
+                    input_boxes=[[b] for b in ref_box_xyxys],
+                    input_boxes_labels=[[1] for _ in ref_box_xyxys],
+                    return_tensors="pt",
+                ).to(model.device)
 
-            with torch.no_grad():
-                outputs = model(**inputs)
+                with torch.no_grad():
+                    outputs = model(**inputs)
 
-            results = processor.post_process_instance_segmentation(
-                outputs,
-                threshold=args.threshold,
-                mask_threshold=args.mask_threshold,
-                target_sizes=inputs.get("original_sizes").tolist(),
-            )[0]
+                results_list = processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=args.threshold,
+                    mask_threshold=args.mask_threshold,
+                    target_sizes=inputs.get("original_sizes").tolist(),
+                )
 
-            masks_canvas = [m.cpu().numpy().astype(np.uint8) for m in results["masks"]]
+                for target_path, canvas, placements, ref_box_xyxy, results in zip(
+                    batch_paths, canvases, placements_list, ref_box_xyxys, results_list
+                ):
+                    done += 1
+                    print(f"  [{done}/{total}] target={target_path.name}")
 
-            raw_mask_canvas = np.zeros((ch, cw), dtype=np.uint8)
-            for m in masks_canvas:
-                raw_mask_canvas |= m
+                    masks_canvas = [m.cpu().numpy().astype(np.uint8) for m in results["masks"]]
+                    scores_canvas = [float(s) for s in results["scores"]]
+                    boxes_canvas = [b.cpu().numpy().tolist() for b in results["boxes"]]
 
-            tgt = placements["tgt"]
-            tx, ty = tgt["offset"]
-            tw, th = tgt["curr_size"]
+                    out_path = output_dir / f"{target_path.stem}__{ref_tag}.png"
+                    process_result(
+                        canvas, placements, ref_box_xyxy, target_imgs[target_path],
+                        masks_canvas, scores_canvas, boxes_canvas,
+                        ref_tag, target_path.name, out_path,
+                    )
 
-            # Per-mask: crop to target region, resize to orig target size, tight bbox.
-            # Masks with no pixels inside the target region are dropped (ref-side only).
-            pred_masks_target = []
-            pred_boxes_target = []
-            for m in masks_canvas:
-                crop = m[ty:ty + th, tx:tx + tw]
-                if not crop.any():
-                    continue
-                mask_target = np.array(
-                    Image.fromarray(crop * 255).resize(tgt["orig_size"], Image.NEAREST)
-                ) > 0
-                box = mask_to_bbox(mask_target)
-                if box is None:
-                    continue
-                pred_masks_target.append(mask_target)
-                pred_boxes_target.append(box)
-
-            combined_mask_target = None
-            if pred_masks_target:
-                combined_mask_target = np.zeros_like(pred_masks_target[0])
-                for m in pred_masks_target:
-                    combined_mask_target |= m
-
-            out_path = target_out_dir / f"{ref['name']}.png"
-            save_step_figure(
-                canvas, ref_box_canvas_xyxy, raw_mask_canvas, target_img,
-                combined_mask_target, pred_boxes_target, ref["name"], target_path.name, out_path,
-            )
+                del inputs, outputs
+                if device == "cuda":
+                    torch.cuda.empty_cache()
 
     print(f"\n[done] Output -> {output_dir.resolve()}")
 
