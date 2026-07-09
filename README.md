@@ -390,6 +390,10 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 11. mAP@.50 = 0.254 on Construction-PPE 10-class eval. Person best (AP=0.559), gloves worst (AP=0.053). Goggles FP-flooded (prec=0.023).
 ---
 
+## Inspirations
+
+- [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) — canvas-composite technique for cross-image few-shot exemplar prompting with a frozen SAM3 (paste reference + target into one shared canvas, remap the reference bbox into canvas coordinates, prompt SAM3 once, crop the target region back out). SAM3 has no native cross-image exemplar API — image-exemplar boxes only match within the same image they're drawn on — so this composite-canvas trick is what `test/debug_sam3.py` uses to test SAM3's raw few-shot capability against labelled reference instances.
+
 ## Collaboration
 
 Open to collaboration — if you have ideas on improving the proposal quality, the scoring stage, or the few-shot head direction above, feel free to reach out or open an issue.

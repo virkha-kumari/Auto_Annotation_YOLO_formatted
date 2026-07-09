@@ -16,3 +16,4 @@ ensemble-boxes
 opencv-python
 tqdm
 gradio>=6.19.0
+accelerate

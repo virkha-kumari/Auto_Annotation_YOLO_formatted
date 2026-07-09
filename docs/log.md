@@ -21,6 +21,24 @@ Considered extending `test/debug_sam2.py` into a SAM2-only few-shot script: ref 
 
 **Next:** Evaluate SAM3 few-shot/visual-prompt capability directly.
 
+### FINDING — SAM3 has no native cross-image exemplar API; canvas-composite trick works around it
+
+Researched SAM3's actual few-shot mechanism (transformers `Sam3Model`/`Sam3Processor`, HF docs + arxiv 2511.16719). Confirmed:
+- SAM3 does Promptable Concept Segmentation — text prompts and/or **image exemplars** (bbox + positive/negative label), finds all matching instances of that concept.
+- Critical limitation: the exemplar box must be drawn on the *same image* being segmented. There is no `refer_image`-style API (unlike YOLOe's `get_vpe`) for "learn from image A, detect in image B."
+- Cross-image few-shot is achievable via a composite-canvas trick from "Few-Shot Semantic Segmentation Meets SAM3" ([WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3)): paste reference image + target image into one shared canvas (stacked or side-by-side), remap the reference's known bbox into canvas-normalized coordinates, run SAM3 once on the composite with that box as a positive geometric exemplar, then crop the target's canvas region back out of the prediction and resize to original size.
+
+### ADDED — `test/debug_sam3.py` rewritten: SAM3 canvas-composite few-shot debug script
+
+Replaced the old plain `mask-generation` pipeline (unprompted auto-mask, same dead end as SAM2 — no class-conditioning) with the canvas-composite few-shot approach above.
+
+- Input: full ref images + YOLO labels (per-instance boxes resolved by class id, not pre-cropped) + target images.
+- For every (ref instance, target image) pair: build composite canvas → SAM3 box-only exemplar prompt (no text, keeps pipeline's no-text-prompts rule) → per-mask crop back to target region → tight bbox per surviving instance.
+- 4-panel debug figure per pair: composite canvas w/ exemplar box, raw SAM3 mask on full canvas, cropped-back result with mask overlay + boxes, clean bbox-only view.
+- Fixed along the way: `.cpu().numpy()` needed before converting CUDA mask tensors to numpy; bbox must be computed **per predicted mask**, not on the OR-merged canvas mask — merging first before bbox-ing produced a box spanning almost the entire image when multiple instances (or ref-bleed) were present. Now each SAM3 instance gets cropped to the target region individually and only kept if it has any pixels there.
+
+**Early read:** promising enough to keep refining — first real signal that SAM3 might get closer to a genuine few-shot auto-annotation path (native concept-matching + box exemplar, not YOLOe-visual-prompt-plus-separate-DINOv2-scoring). Still needs: threshold tuning (currently `--threshold`/`--mask-threshold` both loosened to 0.2 for initial visibility), a real accuracy pass across multiple refs/targets (currently qualitative eyeballing only), and a decision on whether canvas-composite overhead (per-pair forward pass, no batching yet) is fast enough to replace or complement YOLOe+SAM2+DINOv2 in `scripts/auto_annotate.py`.
+
 ---
 
 ## 2026-06-26 (session 2)

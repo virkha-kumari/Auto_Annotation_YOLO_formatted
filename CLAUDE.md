@@ -79,6 +79,7 @@ Used across multiple industrial computer vision projects.
 | `scripts/extract_crops_labelled.py` | Seed crop extraction (clustered) | FINALIZED |
 | `scripts/extract_crops_varied.py` | Seed crop extraction (all) | FINALIZED |
 | `test/debug_yoloe_sam2_dino.py` | Debug pipeline with 4-panel viz | ACTIVE |
+| `test/debug_sam3.py` | SAM3 canvas-composite few-shot debug (4-panel viz) | **ACTIVE — experimental, being refined** |
 | `requirements.txt` | Python deps (PyTorch CUDA 11.8, transformers, etc.) | Exists |
 
 ---
@@ -90,7 +91,8 @@ Used across multiple industrial computer vision projects.
 | YOLOe | Visual-prompt proposal generation | `yoloe-11l-seg.pt` (ultralytics) | **CONFIRMED** — works on a large industrial object class + Construction-PPE at conf>=0.06 |
 | SAM2 | Masked crop producer (not proposer) | `facebook/sam2.1-hiera-base-plus` | **CONFIRMED** for masking — failed as auto-proposer |
 | DINOv2 | Embedding + cosine sim scoring | `facebook/dinov2-base` | **CONFIRMED** — masked patch pooling (normal) + CLS (small) |
-| SAM3 | Region proposal | — | Failed — same issue as SAM2 |
+| SAM3 | Region proposal (unprompted auto-mask) | `facebook/sam3` | Failed — same issue as SAM2 |
+| SAM3 | Cross-image few-shot (canvas-composite exemplar, `test/debug_sam3.py`) | `facebook/sam3` | **ACTIVE — promising early results, being refined.** No native cross-image exemplar API — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. |
 | OWLv2 | Image-guided detection | `google/owlv2-base-patch16-ensemble` | Dead end — cannot detect large objects |
 
 Cached at `C:/Users/Lenovo/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.
@@ -144,6 +146,6 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 ## Known limitations
 
 - **OWLv2** cannot detect large objects (patch-based ViT architecture)
-- **SAM2/SAM3** fail as proposal generators for large uniform regions
+- **SAM2** fail as proposal generators for large uniform regions
 - **DINOv2 masked-patch pooling** breaks for tiny objects (<2% frame area) — use CLS mode
 - **Threshold calibration** not validated across datasets — tune per project
