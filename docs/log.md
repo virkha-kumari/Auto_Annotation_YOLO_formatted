@@ -7,6 +7,22 @@ Format:
 
 ---
 
+## 2026-07-09
+
+### DROPPED — SAM2 as few-shot matcher
+
+Considered extending `test/debug_sam2.py` into a SAM2-only few-shot script: ref crops → SAM2 auto-mask → DINOv2 embed/match → apply to test image. Dropped before implementation.
+
+**Why dropped:**
+- SAM2 has no native few-shot or class-conditioning capability — it only segments, doesn't recognize. Any "few-shot" behavior would come entirely from DINOv2 similarity matching bolted on top.
+- YOLOe, already the pipeline's detector, has genuine native few-shot support (`get_vpe(refer_image)` bakes visual-prompt embeddings into the model, then detects the same visual concept on new images) — that's why YOLOe was incorporated as proposal generator in the first place, not SAM2. Re-deriving few-shot on SAM2 via DINOv2 would just duplicate what YOLOe already does natively, with a weaker signal.
+- `test/debug_yoloe_sam2_dino.py` already covers ref→proposal→match: YOLOe few-shot detects, SAM2 refines mask, DINOv2 confirms similarity. No new capability from a SAM2-only variant.
+- Redirecting effort to SAM3, which reportedly has native few-shot/visual-concept prompting similar to YOLOe's VPE — worth evaluating directly instead.
+
+**Next:** Evaluate SAM3 few-shot/visual-prompt capability directly.
+
+---
+
 ## 2026-06-26 (session 2)
 
 ### ADDED — Multi-class single-pass YOLOe (`scripts/auto_annotate.py`)
