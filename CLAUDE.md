@@ -79,7 +79,7 @@ Used across multiple industrial computer vision projects.
 | `scripts/extract_crops_labelled.py` | Seed crop extraction (clustered) | FINALIZED |
 | `scripts/extract_crops_varied.py` | Seed crop extraction (all) | FINALIZED |
 | `test/debug_yoloe_sam2_dino.py` | Debug pipeline with 4-panel viz | ACTIVE |
-| `test/debug_sam3.py` | SAM3 canvas-composite few-shot debug (4-panel viz) | **ACTIVE — experimental, being refined** |
+| `test/debug_sam3.py` | SAM3 canvas-composite few-shot debug (4-panel viz) | **ACTIVE — confirmed working end-to-end; next: DINOv2 sanity-check score per proposal, then integrate into app.py/auto_annotate.py** |
 | `requirements.txt` | Python deps (PyTorch CUDA 11.8, transformers, etc.) | Exists |
 
 ---
@@ -92,7 +92,7 @@ Used across multiple industrial computer vision projects.
 | SAM2 | Masked crop producer (not proposer) | `facebook/sam2.1-hiera-base-plus` | **CONFIRMED** for masking — failed as auto-proposer |
 | DINOv2 | Embedding + cosine sim scoring | `facebook/dinov2-base` | **CONFIRMED** — masked patch pooling (normal) + CLS (small) |
 | SAM3 | Region proposal (unprompted auto-mask) | `facebook/sam3` | Failed — same issue as SAM2 |
-| SAM3 | Cross-image few-shot (canvas-composite exemplar, `test/debug_sam3.py`) | `facebook/sam3` | **ACTIVE — promising early results, being refined.** No native cross-image exemplar API — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. |
+| SAM3 | Cross-image few-shot (canvas-composite exemplar, `test/debug_sam3.py`) | `facebook/sam3` | **CONFIRMED working end-to-end** on real multi-class dataset. No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Next: add DINOv2 sanity-check scoring per SAM3 proposal (cosine sim vs ref crop, same pattern as YOLOe+DINOv2), then integrate into `app.py`/`scripts/auto_annotate.py`. |
 | OWLv2 | Image-guided detection | `google/owlv2-base-patch16-ensemble` | Dead end — cannot detect large objects |
 
 Cached at `C:/Users/Lenovo/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.

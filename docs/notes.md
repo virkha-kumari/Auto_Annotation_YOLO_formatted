@@ -65,7 +65,7 @@ seed crops: <stem>_cls<id>_<idx>.jpg  (naming enables source reverse-resolution)
 |---|---|---|
 | SAM2 auto mask generation | ❌ Dead end | No proposals on large uniform regions. SAM2 needs texture contrast. |
 | SAM3 auto mask generation (unprompted) | ❌ Dead end | Same as SAM2. |
-| SAM3 canvas-composite few-shot (`test/debug_sam3.py`) | 🔬 **Active — current best few-shot direction, being refined** | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Now supports: SAM3 native box+score visualization alongside mask-derived tight bbox, batched targets-per-ref forward passes (`--batch-size`, speed fix), multi-class (`--class-ids`, explicit or auto-discover "all"), flat output naming. Early qualitative results promising; needs threshold tuning + real accuracy pass before promotion into `scripts/auto_annotate.py`. See `docs/log.md` 2026-07-09. |
+| SAM3 canvas-composite few-shot (`test/debug_sam3.py`) | ✅ **Confirmed working end-to-end** — next: DINOv2 sanity-check score, then promotion | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Supports: SAM3 native box+score visualization alongside mask-derived tight bbox, batched targets-per-ref forward passes (`--batch-size`), multi-class (`--class-ids`, explicit or auto-discover "all"), flat output naming, bf16 inference, DINOv2 diverse-ref selection. Confirmed on real 5-class dataset. **Next:** add DINOv2 cosine-sim sanity check per SAM3 proposal vs ref crop (same scoring pattern as YOLOe pipeline), then real accuracy pass, then promotion into `scripts/auto_annotate.py`. See `docs/log.md` 2026-07-10. |
 | OWLv2 image-guided detection | ❌ Dead end | Patch-based ViT — tile-level texture matching. Cannot compose bbox larger than one tile. Tested at 640/1008/1280px. |
 | YOLOe visual-prompt detection | ✅ Confirmed | Multi-scale FPN detects at all scales. Works at conf≥0.06. |
 
@@ -101,6 +101,7 @@ Designed for OWLv2 (compare source scene to target via DINOv2 sim, filter noisy 
 - [ ] **mAP evaluation** — pipeline output vs Construction-PPE ground truth not yet run.
 - [ ] **Scale to 5K targets** — ~3s/target × 162 stems × 625 chunks = needs profiling at scale.
 - [ ] **Prototype bank size effect** — 200+ ref crops per class vs 20 — does more help or hurt?
+- [ ] **SAM3 proposal sanity check** — add DINOv2 cosine-sim scoring per SAM3 canvas-composite proposal (vs ref crop), same pattern as YOLOe→SAM2→DINOv2. Needed before `test/debug_sam3.py` can be promoted into `scripts/auto_annotate.py`.
 
 ---
 

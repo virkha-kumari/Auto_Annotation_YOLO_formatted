@@ -7,6 +7,29 @@ Format:
 
 ---
 
+## 2026-07-10
+
+### FIXED — `test/debug_sam3.py` bf16 crash: `input_boxes` never cast, dtype mismatch in `boxes_direct_project`
+
+bf16 pass (below) intentionally left `input_boxes` at fp32 to avoid box-position rounding, but the model's `boxes_direct_project` linear layer is bf16 — crashed with `mat1 and mat2 must have the same dtype, but got Float and BFloat16` inside `Sam3Model.forward` → `geometry_encoder` → `_encode_boxes`.
+
+Fix: cast `inputs["input_boxes"]` to `model.dtype` alongside `pixel_values`. Since `model.dtype` is fp32 whenever `--fp32`/CPU is used, the cast is a no-op on that path — no precision risk there. On bf16, the geometry encoder was already going to run this tensor through bf16 math internally regardless (that's why the uncast tensor didn't work), so the explicit cast doesn't add precision loss beyond what the model already imposes.
+
+**Confirmed working end-to-end** with real dataset (`CarrierInspectionWork/7125`, 5 classes, DINOv2 diverse-ref selection, bf16 batched inference).
+
+**Next:** integrate this canvas-composite few-shot path into `app.py` / `scripts/auto_annotate.py` as an alternative/complement to YOLOe+SAM2+DINOv2.
+
+### ADDED — `test/debug_sam3.py` speed pass: bf16, threaded figure saves, diverse ref selection
+
+Sweep was slow (refs × targets × classes, fp32, serial matplotlib saves blocking the GPU). Four changes:
+
+- **bf16 inference** — SAM3 loaded with `torch_dtype=torch.bfloat16` on CUDA (opt-out `--fp32`). Only `pixel_values` cast to bf16; box prompts stay fp32 (bf16 spacing near 1008px is 8 → up to ~4px exemplar-box shift if cast).
+- **Threaded figure saves** — `process_result` (mask crop-back + 4-panel figure) submitted to a 2-worker `ThreadPoolExecutor`; GPU no longer idles during matplotlib rendering. `save_step_figure` rewritten to matplotlib's OO API (`Figure`, no pyplot) — pyplot's global figure registry is not thread-safe.
+- **`--max-refs-per-class` (default 3)** — DINOv2 CLS-embeds all ref crops per class, farthest-point-samples N diverse refs (same FPS as `extract_crops_labelled.py`). Chosen crops saved to `output_dir/temp_refs/cls{id}/` for inspection. DINOv2 loaded/unloaded before SAM3 loads (VRAM rule). Cuts sweep combinatorics by refs/N×.
+- **Dropped per-batch `torch.cuda.empty_cache()`** — inside a single model's loop it just forces a sync and makes the allocator re-cudaMalloc next batch; only needed between different models.
+
+**Note:** bf16 output parity vs fp32 not yet A/B-verified — first run should compare scores on one pair (`--fp32` for baseline).
+
 ## 2026-07-09
 
 ### DROPPED — SAM2 as few-shot matcher

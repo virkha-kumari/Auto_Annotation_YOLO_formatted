@@ -110,8 +110,6 @@ The first major blocker was finding a model that could propose bounding boxes fr
 
 **SAM3 (auto mask generation)** — tried as a replacement. Same architectural premise, same failure mode. Dropped.
 
-*(SAM3 was revisited later via a different mechanism — canvas-composite cross-image exemplar prompting, not auto-mask-generation. See "Inspirations" below and `docs/log.md` 2026-07-09 — actively being refined, currently the most promising few-shot direction under test.)*
-
 **OWLv2 image-guided detection** (`google/owlv2-base-patch16-ensemble`) — seemed promising. Takes query images + target image, returns bounding boxes of similar objects. Tested extensively at 640px, 1008px, 1280px with per-crop pipelines and multi-scale tricks. Result: on a large uniform-color object (~60% of frame), every single proposal was a tiny box at image edges. Best DINOv2 sim on any proposal: 0.699.
 
 The root cause is architectural — OWLv2 is a patch-based ViT that processes images as 16×16 tiles and matches tile-level texture. It cannot compose a bounding box spanning multiple tiles. No amount of resizing fixes this. Dead end confirmed across 3 resolution settings and 2 pipeline configurations.
@@ -176,6 +174,31 @@ Note: batching different `refer_images` in one call is impossible — the VPE is
 Built for OWLv2: before sending crops to the detector, filter by DINOv2 scene similarity between source image and target image. Removes crops from scenes that look nothing like the target — reduces noisy proposals.
 
 For YOLOe: irrelevant. YOLOe's visual prompts are sufficiently discriminative without scene pre-filtering. Proposals are well-localized on all tested datasets regardless of source-target scene similarity. Dropped — extra DINOv2 load/unload cycle for no benefit.
+
+---
+
+### Stage 6 — Pipeline results weren't good enough: reconsidering SAM2, then SAM3
+
+YOLOe→SAM2→DINOv2→WBF was confirmed correct and running end-to-end, but the actual numbers on Construction-PPE weren't satisfactory as an auto-annotation product: mAP@.50 = 0.254 overall, with gloves (F1=0.11), boots (F1=0.21), and goggles (prec=0.023, actively harmful) all bad enough that fixing the auto-annotations would cost more than labeling from scratch (see "Accuracy ceiling" below). On top of that, the pipeline was expensive to iterate on — three models loaded/unloaded sequentially per run, ~20 minutes for 50 targets × 10 classes, most of it SAM2 masking every proposal one chunk at a time — and how much appearance variation a class actually needs isn't knowable up front, so testing a fix for a bad class meant re-running the whole heavy chain. Poor accuracy on hard classes plus a slow, sequential pipeline to test fixes in meant the current design needed either a real fix or a different architecture — not just threshold tuning. That's what pushed a fresh look at whether a different model could do more of the work itself, with fewer sequential stages, starting with SAM2.
+
+**Reconsidered: SAM2 as its own few-shot matcher.** Idea — skip YOLOe entirely for some classes: ref crops → SAM2 auto-mask on the target → DINOv2 embed/match the resulting masks → keep whatever passes threshold. Would cut one model out of the chain.
+
+**Rejected before implementation (2026-07-09):**
+- SAM2 has no native few-shot or class-conditioning — it only segments, it doesn't recognize. All the "few-shot" behavior would still come from DINOv2 similarity bolted on top, same as today, just without YOLOe's actual detection step in front of it.
+- YOLOe is already in the pipeline *because* it has genuine native few-shot support (`get_vpe(refer_image)` bakes the visual prompt into the model, then detects the same concept elsewhere) — that's the reason it was chosen as proposal generator over SAM2 in the first place (Stage 1). Re-deriving few-shot on SAM2 via DINOv2 would just rebuild what YOLOe already does natively, with a weaker signal and no accuracy upside.
+- `test/debug_yoloe_sam2_dino.py` already is that chain — YOLOe detects, SAM2 refines the mask, DINOv2 confirms similarity. A SAM2-only variant adds no new capability, just removes the one component doing real detection.
+
+**Redirected to SAM3 instead** — reportedly has native few-shot/visual-concept prompting similar to YOLOe's VPE, worth evaluating directly rather than re-deriving SAM2 few-shot from scratch.
+
+**SAM3 investigated (2026-07-09).** Read the actual mechanism in `transformers`' `Sam3Model`/`Sam3Processor` + arxiv 2511.16719. SAM3 does support Promptable Concept Segmentation via image exemplars (bbox + pos/neg label) — genuine native few-shot, unlike SAM2. But: the exemplar box must be drawn on the *same image* being segmented. No `refer_image`-style API for "learn from image A, detect in image B." Found the workaround in [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3): composite ref + target into one shared canvas, remap the ref's bbox into canvas coordinates, prompt SAM3 once with that box as exemplar, crop the target region back out afterward.
+
+**`test/debug_sam3.py` rewritten around the canvas-composite trick (2026-07-09).** Replaced the old auto-mask dead end with: ref image + YOLO label → per-instance box resolved by class id → composite canvas → SAM3 box-only exemplar prompt (no text, keeps the pipeline's no-text-prompt rule) → per-mask crop back to target → tight bbox per surviving instance. 4-panel debug viz added. Fixed along the way: bbox must be computed **per predicted mask**, not on the OR-merged canvas mask — merging first produced boxes spanning almost the whole image whenever multiple instances were present. Early qualitative read: promising enough to keep going.
+
+**Speed pass (2026-07-10).** Same scaling pain as the main pipeline showed up here too — refs × targets × classes, all in fp32, matplotlib saves blocking the GPU between calls. Added bf16 inference (`--fp32` to opt out), a threaded figure-save pool so rendering doesn't stall the next forward pass, and `--max-refs-per-class` (DINOv2 CLS-embed + farthest-point-sample N diverse refs per class — same diversity-selection technique as `extract_crops_labelled.py` — so the sweep doesn't brute-force every ref crop against every target).
+
+**bf16 crash, then fix (2026-07-10).** The speed pass crashed: `mat1 and mat2 must have the same dtype, but got Float and BFloat16`. Box coordinates had deliberately been left fp32 to avoid bf16 rounding shifting the exemplar box by a few pixels — but SAM3's geometry encoder runs in bf16 throughout, so the box tensor needed the cast too, just applied right before the forward pass rather than during the box math. Fixed. No new precision risk: on the fp32 path the cast is a no-op, and on bf16 the encoder was always going to run that tensor through bf16 math internally regardless.
+
+**Confirmed working end-to-end (2026-07-10)** on a real multi-class dataset — 5 classes, bf16, DINOv2 diverse-ref selection. Still missing the one thing the YOLOe path already has: a similarity sanity check on its own proposals. SAM3's canvas-composite output has no DINOv2 cosine-sim gate yet, so nothing is filtering out a plausible-looking but wrong match. **Next:** add that scoring layer (same pattern as the existing pipeline — proposal crop vs ref crop, cosine sim, threshold), then a real accuracy pass, before deciding whether this replaces or complements YOLOe→SAM2→DINOv2 in `scripts/auto_annotate.py`.
 
 ---
 
@@ -394,9 +417,7 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 
 ## Inspirations
 
-- [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) — canvas-composite technique for cross-image few-shot exemplar prompting with a frozen SAM3 (paste reference + target into one shared canvas, remap the reference bbox into canvas coordinates, prompt SAM3 once, crop the target region back out). SAM3 has no native cross-image exemplar API — image-exemplar boxes only match within the same image they're drawn on — so this composite-canvas trick is what `test/debug_sam3.py` uses to test SAM3's raw few-shot capability against labelled reference instances.
-
-**Status (2026-07-09, active):** `test/debug_sam3.py` is the current best-performing few-shot direction under test — genuine SAM3 concept-matching + geometric box exemplar, not a YOLOe-visual-prompt-plus-bolted-on-DINOv2-scoring workaround. Actively being refined: score + box visualization (SAM3's native box head + confidence, shown alongside mask-derived tight bbox), batched targets-per-ref forward passes for speed, multi-class support (`--class-ids`, explicit list or auto-discover "all"), flat output naming for fast review. Not yet promoted into `scripts/auto_annotate.py` — still qualitative eyeballing, no accuracy pass yet, threshold calibration pending. See `docs/log.md` 2026-07-09 for full history.
+- [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) — canvas-composite technique for cross-image few-shot exemplar prompting with a frozen SAM3 (paste reference + target into one shared canvas, remap the reference bbox into canvas coordinates, prompt SAM3 once, crop the target region back out). SAM3 has no native cross-image exemplar API — image-exemplar boxes only match within the same image they're drawn on — so this composite-canvas trick is what `test/debug_sam3.py` uses to test SAM3's raw few-shot capability against labelled reference instances. Full incremental history in the ablation's "Stage 6" above and `docs/log.md`.
 
 ## Collaboration
 

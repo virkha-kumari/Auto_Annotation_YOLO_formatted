@@ -22,6 +22,14 @@ one file per (ref, target) pair: output_dir/<target_stem>__cls<id>_<ref>.png
 Targets are batched per ref (--batch-size) into a single SAM3 forward pass
 for speed; lower --batch-size if you hit OOM on 8GB VRAM.
 
+Speed features:
+  - SAM3 runs in bf16 on CUDA by default (--fp32 to disable)
+  - Figure rendering offloaded to a 2-worker thread pool (GPU never waits on matplotlib)
+  - --max-refs-per-class N (default 3): DINOv2 CLS-embeds every ref crop and
+    farthest-point-samples N diverse refs per class (0 = all refs). Chosen crops
+    saved to output_dir/temp_refs/cls{id}/ for inspection. DINOv2 is loaded and
+    unloaded before SAM3 loads (VRAM rule).
+
 Usage:
     python test/debug_sam3.py \\
         --refs-dir    "D:/path/to/labelled_ref_images" \\
@@ -31,12 +39,13 @@ Usage:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.figure import Figure
 from PIL import Image
 from transformers import Sam3Model, Sam3Processor
 
@@ -79,6 +88,74 @@ def collect_ref_instances(refs_dir: Path, refs_labels: Path, class_id: int) -> l
                 "name": f"{img_path.stem}_inst{i}",
             })
     return instances
+
+
+def farthest_point_sample(vectors: np.ndarray, k: int) -> list[int]:
+    """Greedy max-min diversity selection (same as scripts/extract_crops_labelled.py)."""
+    if k <= 0 or len(vectors) == 0:
+        return []
+    k = min(k, len(vectors))
+    seed = int(np.argmax(np.linalg.norm(vectors - vectors.mean(axis=0), axis=1)))
+    selected = [seed]
+    dists = np.full(len(vectors), np.inf)
+    for _ in range(k - 1):
+        last = vectors[selected[-1]]
+        d = np.linalg.norm(vectors - last, axis=1)
+        dists = np.minimum(dists, d)
+        selected.append(int(np.argmax(dists)))
+    return selected
+
+
+def select_diverse_refs(ref_instances_by_class: dict, max_refs: int, output_dir: Path,
+                         device: str) -> dict:
+    """
+    DINOv2 CLS-embed each ref crop, farthest-point-sample max_refs diverse refs per
+    class. Chosen ref crops saved to output_dir/temp_refs/cls{id}/ for inspection.
+    Loads and fully unloads DINOv2 (VRAM rule: must run BEFORE SAM3 is loaded).
+    """
+    from transformers import AutoImageProcessor, AutoModel
+
+    needs_selection = any(len(v) > max_refs for v in ref_instances_by_class.values())
+    dproc = dmodel = None
+    if needs_selection:
+        print("[refs] Loading DINOv2 for diverse ref selection ...")
+        dproc = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+        dmodel = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
+
+    selected_by_class = {}
+    with torch.no_grad():
+        for class_id, instances in ref_instances_by_class.items():
+            crops = []
+            for inst in instances:
+                x, y, w, h = inst["box"]
+                crops.append(inst["image"].crop((int(x), int(y), int(x + w), int(y + h))))
+
+            if len(instances) <= max_refs:
+                keep = list(range(len(instances)))
+            else:
+                embs = []
+                for i in range(0, len(crops), 16):
+                    inputs = dproc(images=crops[i:i + 16], return_tensors="pt").to(device)
+                    out = dmodel(**inputs)
+                    embs.append(out.last_hidden_state[:, 0, :].float().cpu().numpy())
+                embs = np.vstack(embs)
+                normed = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+                keep = farthest_point_sample(normed, max_refs)
+                print(f"[refs] class {class_id}: {len(instances)} -> {len(keep)} diverse ref(s): "
+                      f"{', '.join(instances[i]['name'] for i in keep)}")
+
+            selected_by_class[class_id] = [instances[i] for i in keep]
+
+            temp_refs_dir = output_dir / "temp_refs" / f"cls{class_id}"
+            temp_refs_dir.mkdir(parents=True, exist_ok=True)
+            for i in keep:
+                crops[i].save(temp_refs_dir / f"{instances[i]['name']}.jpg", quality=92)
+
+    if dmodel is not None:
+        del dmodel, dproc
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    return selected_by_class
 
 
 def create_canvas(ref_img: Image.Image, ref_box: list[float], target_img: Image.Image,
@@ -140,7 +217,9 @@ def mask_to_bbox(mask: np.ndarray) -> list[int] | None:
 def save_step_figure(canvas, ref_box_canvas_xyxy, raw_mask_canvas, raw_boxes_canvas, raw_scores_canvas,
                       target_img, pred_mask_target, pred_boxes_target, pred_scores_target,
                       ref_name, target_name, output_path):
-    fig, axes = plt.subplots(1, 4, figsize=(32, 8))
+    # OO API (Figure, not pyplot) — no global state, safe to call from worker threads
+    fig = Figure(figsize=(32, 8))
+    axes = fig.subplots(1, 4)
 
     axes[0].imshow(canvas)
     x1, y1, x2, y2 = ref_box_canvas_xyxy
@@ -184,9 +263,8 @@ def save_step_figure(canvas, ref_box_canvas_xyxy, raw_mask_canvas, raw_boxes_can
     axes[3].set_title(f"Tightened bbox only, per instance ({len(pred_boxes_target)})\nmax score: {max_score_str}", fontsize=9)
     axes[3].axis("off")
 
-    plt.tight_layout()
+    fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
     print(f"[saved] {output_path}")
 
 
@@ -205,6 +283,11 @@ def parse_args():
     p.add_argument("--output-dir", default="output_sam3_fewshot")
     p.add_argument("--batch-size", type=int, default=4,
                     help="Targets batched per forward pass (same ref). Lower if OOM on 8GB VRAM.")
+    p.add_argument("--max-refs-per-class", type=int, default=3,
+                    help="Diverse refs kept per class via DINOv2+farthest-point sampling "
+                         "(0 = use all refs). Chosen crops saved to output_dir/temp_refs/.")
+    p.add_argument("--fp32", action="store_true",
+                    help="Run SAM3 in fp32 (default bf16 on CUDA).")
     return p.parse_args()
 
 
@@ -291,8 +374,15 @@ def main():
         print("[abort] No target images found.")
         return
 
-    print(f"[model] Loading SAM3: {SAM3_MODEL_ID} ...")
-    model = Sam3Model.from_pretrained(SAM3_MODEL_ID, device_map=device)
+    # Diverse ref selection (DINOv2) must run before SAM3 loads — VRAM rule
+    if args.max_refs_per_class > 0:
+        ref_instances_by_class = select_diverse_refs(
+            ref_instances_by_class, args.max_refs_per_class, output_dir, device,
+        )
+
+    dtype = torch.float32 if (args.fp32 or device != "cuda") else torch.bfloat16
+    print(f"[model] Loading SAM3: {SAM3_MODEL_ID} ({dtype}) ...")
+    model = Sam3Model.from_pretrained(SAM3_MODEL_ID, torch_dtype=dtype, device_map=device)
     processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
 
     target_imgs = {p: Image.open(p).convert("RGB") for p in target_paths}
@@ -300,6 +390,9 @@ def main():
     total = sum(len(insts) for insts in ref_instances_by_class.values()) * len(target_paths)
     done = 0
     batch_size = args.batch_size
+    # Figure rendering is CPU-bound and slow — offload so GPU keeps working
+    save_pool = ThreadPoolExecutor(max_workers=2)
+    save_futures = []
     for class_id, ref_instances in ref_instances_by_class.items():
         for ref in ref_instances:
             ref_tag = f"cls{class_id}_{ref['name']}"
@@ -327,6 +420,9 @@ def main():
                     input_boxes_labels=[[1] for _ in ref_box_xyxys],
                     return_tensors="pt",
                 ).to(model.device)
+                inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
+                if "input_boxes" in inputs:
+                    inputs["input_boxes"] = inputs["input_boxes"].to(model.dtype)
 
                 with torch.no_grad():
                     outputs = model(**inputs)
@@ -344,20 +440,25 @@ def main():
                     done += 1
                     print(f"  [{done}/{total}] target={target_path.name}")
 
-                    masks_canvas = [m.cpu().numpy().astype(np.uint8) for m in results["masks"]]
+                    # .to(uint8) before .numpy() — numpy has no bf16 dtype
+                    masks_canvas = [m.to(torch.uint8).cpu().numpy() for m in results["masks"]]
                     scores_canvas = [float(s) for s in results["scores"]]
-                    boxes_canvas = [b.cpu().numpy().tolist() for b in results["boxes"]]
+                    boxes_canvas = [b.float().cpu().numpy().tolist() for b in results["boxes"]]
 
                     out_path = output_dir / f"{target_path.stem}__{ref_tag}.png"
-                    process_result(
+                    save_futures.append(save_pool.submit(
+                        process_result,
                         canvas, placements, ref_box_xyxy, target_imgs[target_path],
                         masks_canvas, scores_canvas, boxes_canvas,
                         ref_tag, target_path.name, out_path,
-                    )
+                    ))
 
                 del inputs, outputs
-                if device == "cuda":
-                    torch.cuda.empty_cache()
+
+    print("\n[save] waiting for figure saves to finish ...")
+    for f in save_futures:
+        f.result()   # re-raise any worker exception
+    save_pool.shutdown()
 
     print(f"\n[done] Output -> {output_dir.resolve()}")
 
