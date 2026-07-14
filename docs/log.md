@@ -7,7 +7,59 @@ Format:
 
 ---
 
+## 2026-07-14
+
+### ADDED — VOC test set for SAM3 mAP eval (150 images, `data/VoC full data/test/`)
+
+Built a stratified 150-image test split from the full 4952-image VOC set (already YOLO-converted, `scripts/voc_xml_to_yolo.py`) to run `scripts/sam3_dinov2_module.py` + `scripts/eval_map.py` against. Two-phase selection: (1) coverage floor of 5 images/class across all 20 VOC classes, multi-object-priority within each class's candidate pool; (2) remaining budget filled with the overall most multi-object/multi-class images. Result: all 20 classes represented (5–133 images/class, person/car/diningtable naturally dominant — matches VOC's real co-occurrence distribution, not an artifact). Copy-only, source `data/VoC full data/` untouched. Not yet run through the pipeline.
+
+### ADDED — `scripts/sam3_dinov2_module.py`: per-target aggregation, containment+dup filter, 2-panel preview
+
+Replaced per-(class, ref_group, target) 4-panel figures with per-target output: all classes/ref_groups' raw SAM3 proposals for a target are pooled, then per-class-id containment filter (`--containment-thresh`, intersection/min_area) + duplicate filter (`--dup-iou-thresh`, IoU) keep the highest-score box per overlap group. Output is one YOLO `.txt` (`output_dir/labels/<stem>.txt`) and one 2-panel PNG per target (`output_dir/<stem>.png`): panel 1 = all raw boxes color-coded by class_id with legend, panel 2 = same target with kept boxes solid-outline / rejected boxes dashed-outline, same class colors.
+
+### PERF — `scripts/sam3_dinov2_module.py`: loop reorder cuts redundant target decode/resize
+
+Root cause: SAM3 forward-pass count is `n_ref_groups × n_targets ÷ batch_size` (unavoidable — canvas-composite trick requires one joint ref+target encode per pair, no native cross-image exemplar API to batch around). But the old loop order (`class → ref_group → target_batch`) redecoded+resized every target image once per (class, ref_group) pair — with 20 classes × up to 5 ref_groups, up to ~100x redundant image I/O per target.
+
+Fix: reordered to `target_batch → class → ref_group` — each target batch is decoded once and reused across every class/ref_group inside that batch. Pure I/O win, forward-pass count and detection output unchanged.
+
+**Considered and rejected:** tiling multiple ref_groups from the same class onto one canvas (grid layout in the ref-half) to cut forward-pass count directly. Rejected — shrinking each ref image into a grid cell to fit N refs on one canvas half degrades resolution, which hurts small-object exemplar quality. Also considered swapping to `post_process_object_detection` (skip mask upsample) with box-based target-region cropping instead of mask-based — tried and didn't work reliably, reverted; `crop_result_to_target` stays mask-based (mask presence in target-half is the "did it land here" signal, not just box overlap).
+
+### ADDED — `scripts/sam3_dinov2_module.py` integrated into `app.py` as Pipeline B; `scripts/auto_annotate.py` renamed `scripts/yoloe_sam2_dinov2_module.py`
+
+Landing page added to `app.py`: picks Pipeline A (YOLOe→SAM2→DINOv2, needs crop extraction) or Pipeline B (SAM3→DINOv2, works directly off labelled reference images, no crop extraction). `run_sam3_pipeline()` calls `scripts/sam3_dinov2_module.py` as a subprocess, same pattern as the existing pipeline call. Page 3 gallery/download made pipeline-agnostic — both write `summary.json` in the same shape, `active_output_dir` state tracks which run to read from.
+
+`scripts/auto_annotate.py` renamed to `scripts/yoloe_sam2_dinov2_module.py` to disambiguate from the new SAM3 module now that there are two production pipelines side by side. README/CLAUDE.md updated throughout.
+
+**Fixed 3 wiring bugs found during integration review** (app.py never actually run against the new module before this):
+- `app.py` sent `--dup-iou`, module's arg is `--dup-iou-thresh` — would have crashed on first run.
+- `app.py` sent `--dino-thresh` to a module that has no such argument (no DINOv2 gate implemented yet, see below) — would have crashed on first run. Removed from `app.py` call + UI (`dino_thresh_p2b` widget dropped).
+- `sam3_dinov2_module.py` never wrote `summary.json` — Page 3's gallery/download reads it, so a successful SAM3 run would silently show an empty results page. Added: `summary[target_name] = {label_file, preview_file, n_final_total}`, same shape as Pipeline A's, written after all per-target saves complete.
+
+**Explicitly NOT done this pass** — `sam3_dinov2_module.py` still has no DINOv2 cosine-sim gate on its own proposals, only containment + duplicate suppression (per the "Next" note from 2026-07-10). Scoped out of this integration pass to avoid conflating a wiring fix with a new scoring feature; remains the next real task before a SAM3 vs YOLOe accuracy comparison is meaningful.
+
+Also deleted `scripts/temp.py` (585-line stale draft/scratch copy of the SAM3 module, superseded by `scripts/sam3_dinov2_module.py`, not referenced anywhere).
+
+---
+
 ## 2026-07-10
+
+### ADDED — `test/debug_sam3.py` RAM guard, phash dedup, progress bars, multi-box ref grouping
+
+Sequence of fixes/features driven by a 90%-RAM crash on a full 25-class, 9988-image run:
+
+- **RAM crash root cause** — `collect_ref_instances` re-scanned + fully pixel-decoded all ref images once PER CLASS (25×), accumulating decoded images in a list never freed until return.
+- **Fix: parse-then-parallel pattern (from `EDA_intra_class_variation_scripts`)** — new `collect_ref_boxes` does one metadata-only pass over all ref images (header-only `Image.open().size`, no pixel decode) building `{img_path, box, name}` per instance bucketed by class. Full-image decode now only happens lazily: `_load_crop` decodes-crops-discards per instance for DINOv2 embedding, and `select_diverse_refs` only keeps a full decoded image for instances that SURVIVE farthest-point-sample selection.
+- **RAM guard** — module-level `ram_guard()`: if `psutil.virtual_memory().percent >= 90`, force `gc.collect()`. Called after each embedding batch and each save-future drain.
+- **Target images also switched to per-batch decode** — was decoding+holding ALL target images upfront; now `batch_target_imgs` decoded fresh per batch, freed after.
+- **phash near-duplicate dedup** (`--phash-max-dist`, default 0=off) — `_phash_dedup`, same growable-hash-matrix pattern as `scripts/extract_crops_labelled.py`'s `phase1_extract_class`, runs before DINOv2 embedding to cut near-duplicate video-frame refs.
+- **tqdm progress bars** — per-class DINOv2 embedding batches and phash dedup, previously silent for minutes on large classes (14577 instances one case).
+- **CLI-exposed tunables** — `--dinov2-batch-size`, `--phash-max-dist`, `--save-workers`, `--ref-jpeg-quality` (previously hardcoded).
+- **Bounded `save_futures`** — was accumulating unboundedly for the whole run; now drains every `save_workers*4` submissions, `f.result()` on each to surface worker exceptions promptly instead of only at the very end.
+- **Malformed-label hardening** — `discover_class_ids` and `collect_ref_boxes` now try/except around class-id parse, image-open, image-size validation, and box-coordinate parse — warn+skip instead of crashing the whole multi-class run on one bad line.
+- **Multi-box ref grouping** — ref instances sharing the same source image (a frame with multiple boxes of the same class) are grouped into ONE canvas + ONE SAM3 call with all their boxes as a multi-box exemplar prompt (`input_boxes=[[b1,b2,...]]`), instead of one SAM3 call per instance. Only fires when diverse-ref selection keeps ≥2 instances from the same frame; refs from different frames still get separate canvases (can't share one image half).
+
+**Image count math (not obvious):** total saved figures = `targets × Σ_classes ref_groups_kept_per_class`, where `ref_groups_kept_per_class ≤ max_refs_per_class` (after phash dedup + DINOv2 FPS), and further collapses only when multiple kept refs share a source image. NOT `targets × classes × per_bbox_class` — raw per-class bbox count only matters pre-selection.
 
 ### FIXED — `test/debug_sam3.py` bf16 crash: `input_boxes` never cast, dtype mismatch in `boxes_direct_project`
 

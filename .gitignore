@@ -8,3 +8,4 @@ crop*/
 !docs/images/*.png
 output*/
 data/
+*.pyc

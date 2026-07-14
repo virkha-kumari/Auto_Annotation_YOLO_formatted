@@ -206,7 +206,7 @@ def run_pipeline(
     cls_ids    = parse_selected_ids(selected_classes_p2)
     classes    = load_classes(classes_txt_p2)
     crops_base = Path(crops_dir_override) if crops_dir_override else crops_dir_for(images_dir_p1)
-    script     = str(Path(__file__).parent / "scripts" / "auto_annotate.py")
+    script     = str(Path(__file__).parent / "scripts" / "yoloe_sam2_dinov2_module.py")
     out_dir    = str(Path(output_dir))
 
     full_log          = ""
@@ -295,6 +295,106 @@ def run_pipeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Page 2b — SAM3 pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_sam3_classes(refs_labels_dir: str):
+    """SAM3 path has no classes.txt dropdown wired to names — discover ids directly
+    from label files and show them as plain ids (no class-name mapping needed here)."""
+    labels_path = Path(refs_labels_dir)
+    if not labels_path.is_dir():
+        return gr.update(choices=[], value=[], interactive=False)
+    ids = set()
+    for label_file in labels_path.glob("*.txt"):
+        for line in label_file.read_text().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                try:
+                    ids.add(int(parts[0]))
+                except ValueError:
+                    pass
+    choices = [str(i) for i in sorted(ids)]
+    return gr.update(choices=choices, value=[], interactive=bool(choices))
+
+
+def run_sam3_pipeline(
+    refs_dir, refs_labels_dir, selected_classes, targets_dir, output_dir,
+    orientation, split_ratio, canvas_size,
+    threshold, batch_size,
+    max_refs_per_class, dinov2_batch_size, phash_max_dist,
+    dup_iou, containment_thresh,
+    fp32, ref_jpeg_quality,
+):
+    if not refs_dir or not Path(refs_dir).is_dir():
+        yield "❌ Refs dir not found.", gr.update(interactive=False), []
+        return
+    if not refs_labels_dir or not Path(refs_labels_dir).is_dir():
+        yield "❌ Refs labels dir not found.", gr.update(interactive=False), []
+        return
+    if not targets_dir or not Path(targets_dir).is_dir():
+        yield "❌ Targets dir not found.", gr.update(interactive=False), []
+        return
+
+    script = str(Path(__file__).parent / "scripts" / "sam3_dinov2_module.py")
+    class_ids = selected_classes if selected_classes else ["all"]
+
+    cmd = [
+        sys.executable, script,
+        "--refs-dir", refs_dir,
+        "--refs-labels", refs_labels_dir,
+        "--class-ids", *class_ids,
+        "--targets-dir", targets_dir,
+        "--output-dir", str(output_dir),
+        "--orientation", orientation,
+        "--split-ratio", str(split_ratio),
+        "--canvas-size", str(int(canvas_size)),
+        "--threshold", str(threshold),
+        "--batch-size", str(int(batch_size)),
+        "--max-refs-per-class", str(int(max_refs_per_class)),
+        "--dinov2-batch-size", str(int(dinov2_batch_size)),
+        "--phash-max-dist", str(int(phash_max_dist)),
+        "--dup-iou-thresh", str(dup_iou),
+        "--containment-thresh", str(containment_thresh),
+        "--ref-jpeg-quality", str(int(ref_jpeg_quality)),
+    ]
+    if fp32:
+        cmd.append("--fp32")
+
+    full_log = f"[cmd] {' '.join(cmd)}\n"
+    yield full_log, gr.update(interactive=False), []
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    for line in proc.stdout:
+        if not is_tqdm_line(line):
+            full_log += line
+            yield full_log, gr.update(interactive=False), []
+    proc.wait()
+
+    if proc.returncode != 0:
+        full_log += f"\n❌ Pipeline failed (exit {proc.returncode})\n"
+        yield full_log, gr.update(interactive=False), []
+        return
+
+    full_log += "\n✅ Done\n"
+
+    all_result_images = []
+    summary_path = Path(output_dir) / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        for target_name, info in summary.items():
+            preview = Path(info.get("preview_file", ""))
+            if preview.exists():
+                n = info.get("n_final_total", "?")
+                all_result_images.append((str(preview), f"{Path(target_name).stem} | {n} box(es)"))
+
+    yield full_log, gr.update(interactive=True), all_result_images
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page 3 — results + download
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -359,8 +459,28 @@ def build_app():
 
         gr.Markdown("# 🏭 Auto-Annotation Pipeline")
 
+        # ── LANDING PAGE ──────────────────────────────────────────────────────
+        with gr.Group(visible=True) as landing_page:
+            gr.Markdown("## Choose Pipeline")
+            with gr.Row():
+                with gr.Column(variant="panel"):
+                    gr.Markdown(
+                        "### YOLOe → SAM2 → DINOv2\n"
+                        "Visual-prompt detection. Needs a crop-extraction step first.\n\n"
+                        "✅ Confirmed working on large industrial objects + PPE."
+                    )
+                    choose_yoloe_btn = gr.Button("▶ Use YOLOe → SAM2 → DINOv2", variant="primary")
+                with gr.Column(variant="panel"):
+                    gr.Markdown(
+                        "### SAM3 → DINOv2\n"
+                        "Canvas-composite few-shot exemplar prompting, directly on labelled "
+                        "reference images.\n\n"
+                        "⚡ No crop-extraction step needed."
+                    )
+                    choose_sam3_btn = gr.Button("▶ Use SAM3 → DINOv2", variant="primary")
+
         # ── PAGE 1 ────────────────────────────────────────────────────────────
-        with gr.Group(visible=True) as page1:
+        with gr.Group(visible=False) as page1:
             gr.Markdown("## Step 1 — Dataset & Crop Extraction")
 
             with gr.Row():
@@ -406,7 +526,7 @@ def build_app():
                 stride_p1 = gr.Slider(1, 10, value=2, step=1,
                     label="Stride",
                     info="Process every Nth image. Stride=2 halves scan time.")
-                padding_p1 = gr.Number(value=0.05, precision=3,
+                padding_p1 = gr.Number(value=0.0, precision=3,
                     label="BBox padding",
                     info="Fractional padding around each crop bbox. 0.05 = 5% context around the object.")
                 min_hash_dist_p1 = gr.Slider(0, 20, value=6, step=1,
@@ -522,7 +642,7 @@ def build_app():
                 dino_thresh = gr.Number(value=0.65, precision=3,
                     label="DINOv2 similarity threshold",
                     info="Min cosine similarity (masked-patch pooling) to keep a proposal. Below this = dropped before WBF.")
-                dino_batch_size = gr.Slider(4, 64, value=16, step=4,
+                dino_batch_size = gr.Slider(4, 64, value=32, step=4,
                     label="DINOv2 batch size",
                     info="Embedding batch size. Reduce if VRAM OOM during DINOv2 phase.")
                 small_obj_thresh = gr.Number(value=0.02, precision=4,
@@ -560,6 +680,105 @@ def build_app():
                 back_to_p1 = gr.Button("← Back", variant="secondary")
                 next_to_p3 = gr.Button("Next → Results", variant="secondary", interactive=False)
 
+        # ── PAGE 2b — SAM3 ───────────────────────────────────────────────────
+        with gr.Group(visible=False) as page2b:
+            gr.Markdown("## SAM3 → DINOv2 Pipeline")
+
+            with gr.Row():
+                refs_dir_p2b = gr.Textbox(
+                    label="Reference images folder",
+                    placeholder="D:/project/labelled_ref_images",
+                    info="Full labelled reference images (not crops) — SAM3 needs the whole frame to build the canvas.",
+                )
+                refs_dir_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
+            with gr.Row():
+                refs_labels_dir_p2b = gr.Textbox(
+                    label="Reference labels folder",
+                    placeholder="Auto-filled from refs folder",
+                    info="YOLO .txt labels, same stem as reference images.",
+                )
+                refs_labels_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
+
+            refs_dir_p2b.change(autofill_labels, refs_dir_p2b, refs_labels_dir_p2b)
+
+            with gr.Row():
+                class_dropdown_p2b = gr.Dropdown(
+                    label="Classes to annotate",
+                    choices=[], multiselect=True, interactive=False,
+                    info="Leave empty to auto-discover + use every class id found in the labels.",
+                )
+                load_classes_btn_p2b = gr.Button("Discover classes", variant="secondary", scale=0)
+
+            with gr.Row():
+                targets_dir_p2b = gr.Textbox(
+                    label="Targets folder (unlabeled)",
+                    placeholder="D:/project/images/train",
+                    info="Folder of unlabeled images to auto-annotate.",
+                )
+                targets_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
+            with gr.Row():
+                output_dir_p2b = gr.Textbox(
+                    label="Output folder",
+                    value="output_sam3_dinov2",
+                    info="Results saved here: previews/, labels/, temp_refs/, ref_crops_temp_embed/",
+                )
+                output_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
+
+            gr.Markdown("### Canvas-composite exemplar")
+            with gr.Row():
+                orientation_p2b = gr.Radio(choices=["vertical", "horizontal"], value="vertical",
+                    label="Canvas orientation",
+                    info="How ref and target halves are stacked on the shared canvas.")
+                split_ratio_p2b = gr.Number(value=0.5, precision=2,
+                    label="Split ratio",
+                    info="Fraction of canvas given to the ref half. 0.5 = even split.")
+                canvas_size_p2b = gr.Slider(504, 1512, value=1008, step=126,
+                    label="Canvas size (px)",
+                    info="Square canvas side length SAM3 processes.")
+
+            gr.Markdown("### SAM3")
+            with gr.Row():
+                threshold_p2b = gr.Number(value=0.6, precision=3,
+                    label="SAM3 score threshold",
+                    info="post_process_object_detection score gate.")
+                batch_size_p2b = gr.Slider(1, 16, value=8, step=1,
+                    label="Target batch size",
+                    info="Targets per SAM3 forward pass (same ref group). Lower if OOM on 8GB VRAM.")
+                fp32_p2b = gr.Checkbox(value=False,
+                    label="Force fp32",
+                    info="Default is bf16 on CUDA. Check to disable.")
+
+            gr.Markdown("### Diverse ref selection (DINOv2)")
+            with gr.Row():
+                max_refs_p2b = gr.Number(value=5, precision=0,
+                    label="Max refs per class",
+                    info="Diverse refs kept via DINOv2 + farthest-point sampling. 0 = use all refs.")
+                dinov2_batch_size_p2b = gr.Slider(4, 64, value=32, step=4,
+                    label="DINOv2 batch size",
+                    info="Used for both ref embedding and target box scoring.")
+                phash_max_dist_p2b = gr.Slider(0, 20, value=0, step=1,
+                    label="Phash max dist",
+                    info="Near-duplicate ref crop dedup before DINOv2 embedding. 0 = disabled.")
+                ref_jpeg_quality_p2b = gr.Slider(50, 100, value=80, step=5,
+                    label="Ref crop JPEG quality",
+                    info="Quality for saved crops in output_dir/temp_refs/.")
+
+            gr.Markdown("### Duplicate + containment filter")
+            with gr.Row():
+                dup_iou_p2b = gr.Number(value=0.85, precision=3,
+                    label="Duplicate IoU",
+                    info="Above this, two SAM3 proposals (same class+target) are merged: highest-score box's coords kept, scores averaged.")
+                containment_thresh_p2b = gr.Number(value=0.85, precision=3,
+                    label="Containment threshold",
+                    info="Fully-inside-another-box ratio above which the lower-score box is dropped.")
+
+            run_sam3_btn = gr.Button("▶ Run SAM3 Pipeline", variant="primary")
+            sam3_log = gr.Textbox(label="Log", lines=15, interactive=False, autoscroll=True)
+
+            with gr.Row():
+                back_to_landing_from_2b = gr.Button("← Back", variant="secondary")
+                next_to_p3_from_2b = gr.Button("Next → Results", variant="secondary", interactive=False)
+
         # ── PAGE 3 ────────────────────────────────────────────────────────────
         with gr.Group(visible=False) as page3:
             gr.Markdown("## Step 3 — Results & Download")
@@ -593,40 +812,42 @@ def build_app():
         crops_dir_state    = gr.State("")
         result_images_state = gr.State([])
 
-        # Page navigation
-        def to_page(p1_vis, p2_vis, p3_vis):
-            return gr.update(visible=p1_vis), gr.update(visible=p2_vis), gr.update(visible=p3_vis)
+        def show_only(which: str):
+            """which in {landing, page1, page2, page2b, page3} — all 5 pages toggled explicitly."""
+            return (
+                gr.update(visible=which == "landing"),
+                gr.update(visible=which == "page1"),
+                gr.update(visible=which == "page2"),
+                gr.update(visible=which == "page2b"),
+                gr.update(visible=which == "page3"),
+            )
+
+        PAGE_OUTPUTS = [landing_page, page1, page2, page2b, page3]
+
+        # Landing page choices
+        choose_yoloe_btn.click(lambda: show_only("page1"), outputs=PAGE_OUTPUTS)
+        choose_sam3_btn.click(lambda: show_only("page2b"), outputs=PAGE_OUTPUTS)
 
         next_to_p2.click(
             lambda classes_txt, images_dir, labels_dir: (
-                gr.update(visible=False),
-                gr.update(visible=True),
-                gr.update(visible=False),
+                *show_only("page2"),
                 classes_txt,
                 images_dir,
                 labels_dir,
                 "",   # crops_dir_state — empty = derive from images_dir_p1
             ),
             inputs=[classes_txt_p1, images_dir_p1, labels_dir_p1],
-            outputs=[page1, page2, page3, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2, crops_dir_state],
+            outputs=[*PAGE_OUTPUTS, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2, crops_dir_state],
         ).then(
             update_pipeline_classes, classes_txt_p2, class_dropdown_p2
         )
 
-        back_to_p1.click(
-            lambda: (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)),
-            outputs=[page1, page2, page3],
-        )
+        back_to_p1.click(lambda: show_only("page1"), outputs=PAGE_OUTPUTS)
+        next_to_p3.click(lambda: show_only("page3"), outputs=PAGE_OUTPUTS)
+        back_to_p2.click(lambda: show_only("page2"), outputs=PAGE_OUTPUTS)
 
-        next_to_p3.click(
-            lambda: (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)),
-            outputs=[page1, page2, page3],
-        )
-
-        back_to_p2.click(
-            lambda: (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)),
-            outputs=[page1, page2, page3],
-        )
+        back_to_landing_from_2b.click(lambda: show_only("landing"), outputs=PAGE_OUTPUTS)
+        next_to_p3_from_2b.click(lambda: show_only("page3"), outputs=PAGE_OUTPUTS)
 
         # Browse buttons (tkinter folder/file dialogs)
         classes_browse_btn_p1.click(browse_file,   outputs=classes_txt_p1)
@@ -638,6 +859,10 @@ def build_app():
         source_labels_browse_btn_p2.click(browse_folder, outputs=source_labels_dir_p2)
         output_browse_btn_p2.click( browse_folder, outputs=output_dir_p2)
         save_browse_btn_p3.click(   browse_folder, outputs=save_folder_p3)
+        refs_dir_browse_btn_p2b.click(browse_folder, outputs=refs_dir_p2b)
+        refs_labels_browse_btn_p2b.click(browse_folder, outputs=refs_labels_dir_p2b)
+        targets_browse_btn_p2b.click(browse_folder, outputs=targets_dir_p2b)
+        output_browse_btn_p2b.click(browse_folder, outputs=output_dir_p2b)
 
         # Class loading
         load_classes_btn.click(update_class_dropdown, classes_txt_p1, class_dropdown_p1)
@@ -660,25 +885,20 @@ def build_app():
         skip_crops_browse_btn.click(browse_folder, outputs=skip_crops_dir)
 
         crops_dir_state = gr.State("")
+        active_output_dir = gr.State("")  # which output dir Page3 reads from (YOLOe or SAM3 run)
 
         def do_skip(skip_dir, classes_txt, images_dir, labels_dir):
             if not skip_dir or not Path(skip_dir).is_dir():
-                return (
-                    gr.update(visible=True), gr.update(visible=False), gr.update(visible=False),
-                    "", classes_txt, images_dir, labels_dir,
-                )
-            return (
-                gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
-                skip_dir, classes_txt, images_dir, labels_dir,
-            )
+                return (*show_only("page1"), "", classes_txt, images_dir, labels_dir)
+            return (*show_only("page2"), skip_dir, classes_txt, images_dir, labels_dir)
 
         skip_to_p2_btn.click(
             do_skip,
             inputs=[skip_crops_dir, classes_txt_p1, images_dir_p1, labels_dir_p1],
-            outputs=[page1, page2, page3, crops_dir_state, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2],
+            outputs=[*PAGE_OUTPUTS, crops_dir_state, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2],
         ).then(update_pipeline_classes, classes_txt_p2, class_dropdown_p2)
 
-        # Pipeline
+        # Pipeline (YOLOe)
         run_pipeline_btn.click(
             run_pipeline,
             inputs=[
@@ -693,26 +913,48 @@ def build_app():
             outputs=[pipeline_log, next_to_p3, result_images_state],
         )
 
-        # Gallery
+        # Pipeline (SAM3)
+        load_classes_btn_p2b.click(update_sam3_classes, refs_labels_dir_p2b, class_dropdown_p2b)
+
+        run_sam3_btn.click(
+            run_sam3_pipeline,
+            inputs=[
+                refs_dir_p2b, refs_labels_dir_p2b, class_dropdown_p2b, targets_dir_p2b, output_dir_p2b,
+                orientation_p2b, split_ratio_p2b, canvas_size_p2b,
+                threshold_p2b, batch_size_p2b,
+                max_refs_p2b, dinov2_batch_size_p2b, phash_max_dist_p2b,
+                dup_iou_p2b, containment_thresh_p2b,
+                fp32_p2b, ref_jpeg_quality_p2b,
+            ],
+            outputs=[sam3_log, next_to_p3_from_2b, result_images_state],
+        )
+
+        # Gallery — active_output_dir tracks which run (YOLOe/SAM3) Page3 should read
         def refresh_gallery(output_dir, classes_txt, selected_classes):
             return collect_results(output_dir, classes_txt, selected_classes)
 
         refresh_btn.click(
             refresh_gallery,
-            inputs=[output_dir_p2, classes_txt_p2, class_dropdown_p2],
+            inputs=[active_output_dir, classes_txt_p2, class_dropdown_p2],
             outputs=[result_gallery],
         )
 
-        next_to_p3.click(
+        next_to_p3.click(lambda d: d, inputs=output_dir_p2, outputs=active_output_dir).then(
             refresh_gallery,
-            inputs=[output_dir_p2, classes_txt_p2, class_dropdown_p2],
+            inputs=[active_output_dir, classes_txt_p2, class_dropdown_p2],
+            outputs=[result_gallery],
+        )
+
+        next_to_p3_from_2b.click(lambda d: d, inputs=output_dir_p2b, outputs=active_output_dir).then(
+            refresh_gallery,
+            inputs=[active_output_dir, classes_txt_p2, class_dropdown_p2],
             outputs=[result_gallery],
         )
 
         # Download
         download_all_btn.click(
             download_yolo_labels,
-            inputs=[output_dir_p2, save_folder_p3, classes_txt_p2, class_dropdown_p2],
+            inputs=[active_output_dir, save_folder_p3, classes_txt_p2, class_dropdown_p2],
             outputs=[download_status],
         )
 

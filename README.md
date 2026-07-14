@@ -4,7 +4,7 @@ Few-shot auto-annotation for industrial computer vision datasets. Label 10–15 
 
 ---
 
-## Results — Construction-PPE dataset
+## Results — Construction-PPE dataset - Pipeline A
 
 Dataset: [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics). Eval on 50-image subset with ground truth using `scripts/eval_map.py`.
 
@@ -198,7 +198,9 @@ YOLOe→SAM2→DINOv2→WBF was confirmed correct and running end-to-end, but th
 
 **bf16 crash, then fix (2026-07-10).** The speed pass crashed: `mat1 and mat2 must have the same dtype, but got Float and BFloat16`. Box coordinates had deliberately been left fp32 to avoid bf16 rounding shifting the exemplar box by a few pixels — but SAM3's geometry encoder runs in bf16 throughout, so the box tensor needed the cast too, just applied right before the forward pass rather than during the box math. Fixed. No new precision risk: on the fp32 path the cast is a no-op, and on bf16 the encoder was always going to run that tensor through bf16 math internally regardless.
 
-**Confirmed working end-to-end (2026-07-10)** on a real multi-class dataset — 5 classes, bf16, DINOv2 diverse-ref selection. Still missing the one thing the YOLOe path already has: a similarity sanity check on its own proposals. SAM3's canvas-composite output has no DINOv2 cosine-sim gate yet, so nothing is filtering out a plausible-looking but wrong match. **Next:** add that scoring layer (same pattern as the existing pipeline — proposal crop vs ref crop, cosine sim, threshold), then a real accuracy pass, before deciding whether this replaces or complements YOLOe→SAM2→DINOv2 in `scripts/auto_annotate.py`.
+**Confirmed working end-to-end (2026-07-10)** on a real multi-class dataset — 5 classes, bf16, DINOv2 diverse-ref selection.
+
+**Integrated as a second production pipeline (2026-07-14).** `test/debug_sam3.py` (per-pair 4-panel debug figures) rewritten into `scripts/sam3_dinov2_module.py`: per-target aggregation across all classes/ref-groups, containment + duplicate filter, one YOLO `.txt` + one 2-panel preview per target, `summary.json`. Wired into `app.py` as a second wizard path (landing page picks YOLOe→SAM2→DINOv2 or SAM3→DINOv2 — SAM3 skips crop extraction entirely, works straight off labelled reference images). Still missing the one thing the YOLOe path already has: a similarity sanity check on its own proposals — SAM3's canvas-composite output has no DINOv2 cosine-sim gate yet, only containment/duplicate suppression. **Next:** add that scoring layer (proposal crop vs ref crop, cosine sim, threshold), then a real accuracy pass, before deciding whether this replaces or complements YOLOe→SAM2→DINOv2.
 
 ---
 
@@ -228,12 +230,21 @@ Opens at `http://127.0.0.1:7860`. Three-page wizard:
 ### 3. Or run directly
 
 ```bash
-python scripts/auto_annotate.py \
+# YOLOe -> SAM2 -> DINOv2 (needs seed crops from step above)
+python scripts/yoloe_sam2_dinov2_module.py \
     --queries-dirs  "path/to/crops/cls0"  "path/to/crops/cls1" \
     --class-ids     0  1 \
     --targets-dir   "path/to/unlabeled/images" \
     --source-images "path/to/labelled/images" \
     --labels        "path/to/labelled/labels" \
+    --output-dir    "path/to/output"
+
+# SAM3 -> DINOv2 (canvas-composite few-shot, no crop-extraction step needed)
+python scripts/sam3_dinov2_module.py \
+    --refs-dir      "path/to/labelled/images" \
+    --refs-labels   "path/to/labelled/labels" \
+    --class-ids     0 1 \
+    --targets-dir   "path/to/unlabeled/images" \
     --output-dir    "path/to/output"
 ```
 
@@ -243,11 +254,14 @@ python scripts/auto_annotate.py \
 
 | File | Role | Status |
 |---|---|---|
-| `app.py` | Gradio 3-page wizard UI | Active |
-| `scripts/auto_annotate.py` | Main pipeline — YOLOe→SAM2→DINOv2→WBF→YOLO | Active |
-| `scripts/extract_crops_labelled.py` | Seed crop extraction with DINOv2+DBSCAN diversity selection | Active |
+| `app.py` | Gradio wizard UI — landing page picks YOLOe or SAM3 path | Active |
+| `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A — YOLOe→SAM2→DINOv2→WBF→YOLO | Active |
+| `scripts/sam3_dinov2_module.py` | Pipeline B — SAM3 canvas-composite few-shot→containment/dup filter→YOLO | Active |
+| `scripts/extract_crops_labelled.py` | Seed crop extraction with DINOv2+DBSCAN diversity selection (Pipeline A only) | Active |
 | `scripts/extract_crops_varied.py` | Seed crop extraction without clustering (all crops) | Active |
-| `test/debug_yoloe_sam2_dino.py` | Full pipeline debug with 4-panel matplotlib viz | Active |
+| `scripts/eval_map.py` | mAP/P/R/F1 evaluation vs ground truth | Active |
+| `test/debug_yoloe_sam2_dino.py` | Pipeline A debug, 4-panel matplotlib viz | Active |
+| `test/debug_sam3.py` | Pipeline B debug, 4-panel matplotlib viz per (ref, target) pair | Active |
 | `test/test_yoloe_batch.py` | Benchmark: batched vs per-target YOLOe (confirmed 2.91×) | Reference |
 | `utils/debug_yoloe.py` | Pure YOLOe visual-prompt debug (no DINOv2) | Reference |
 
@@ -287,6 +301,7 @@ python scripts/auto_annotate.py \
 
 ## Output
 
+**Pipeline A (`yoloe_sam2_dinov2_module.py`):**
 ```
 output_dir/
 ├── image1.txt              # YOLO format: cls cx cy w h per line (all classes in one file)
@@ -297,15 +312,28 @@ output_dir/
                             #   classes: {cls_id: {n_proposals, n_wbf, n_final, boxes}}}}
 ```
 
+**Pipeline B (`sam3_dinov2_module.py`):**
+```
+output_dir/
+├── labels/
+│   ├── image1.txt          # YOLO format, all classes in one file per target
+│   └── image2.txt
+├── image1.png               # 2-panel matplotlib preview: raw SAM3 proposals | kept(solid)/rejected(dashed)
+├── image2.png
+├── temp_refs/cls<id>/       # diverse-ref crops chosen by DINOv2+farthest-point sampling
+└── summary.json             # {target_name: {label_file, preview_file, n_final_total}}
+```
+
 ---
 
 ## Models
 
 | Model | Role | ID |
 |---|---|---|
-| YOLOe | Visual-prompt proposals | `yoloe-11l-seg.pt` (ultralytics auto-download) |
-| SAM2 | Masked crop generation | `facebook/sam2.1-hiera-base-plus` (HuggingFace) |
-| DINOv2 | Embedding + similarity scoring | `facebook/dinov2-base` (HuggingFace) |
+| YOLOe | Visual-prompt proposals (Pipeline A) | `yoloe-11l-seg.pt` (ultralytics auto-download) |
+| SAM2 | Masked crop generation (Pipeline A) | `facebook/sam2.1-hiera-base-plus` (HuggingFace) |
+| SAM3 | Canvas-composite few-shot proposals (Pipeline B) | `facebook/sam3` (HuggingFace, gated — needs HF auth) |
+| DINOv2 | Embedding + similarity scoring (both pipelines) | `facebook/dinov2-base` (HuggingFace) |
 
 Cached at `~/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.
 
@@ -372,7 +400,7 @@ Everything built and tested in this repo, in order:
 
 **`scripts/extract_crops_varied.py`** — same as above but no clustering. All deduped crops saved. Used when class has low visual variance or you want maximum diversity without DBSCAN.
 
-**`scripts/auto_annotate.py`** — main production pipeline. Four phases, models loaded/unloaded sequentially (VRAM rule):
+**`scripts/yoloe_sam2_dinov2_module.py`** — Pipeline A, main production pipeline. Four phases, models loaded/unloaded sequentially (VRAM rule):
 - Phase 1: YOLOe loads once, pre-builds `stem_prompts` dict (label reads happen once at startup, not N_targets × N_stems), bakes VPE per stem via `get_vpe()` + `set_classes()`, batches all target images per stem. 2.91× speedup over per-target loop confirmed.
 - Phase 2a: SAM2 loads once, masks all reference crops per class (SAM2/masked-patch classes only), skips SAM2 for small-object classes (bbox-crop/mean-pool routing). Phase 2b: SAM2 masks all target proposals in chunks of 50 boxes/call (OOM fix added after hitting CUDA OOM with 300+ boxes/image when running 10 classes).
 - Phase 3: DINOv2 loads once, builds proto bank per class (individual crop embeddings, not averaged), scores all proposals via cosine sim `prop @ bank.T → max`, drops below `--dino-thresh`.
@@ -382,7 +410,9 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 
 **`scripts/eval_map.py`** — evaluation script (new, this session). Pure numpy, no torchvision/pycocotools. Loads predicted YOLO `.txt` + GT YOLO `.txt`, reads scores from `summary.json` if present (else uniform 1.0), computes per-class P/R/F1 at configurable IoU, AP@.50 (101-point interpolation), mAP@.50:.95 (10-threshold COCO average). Global confidence-sorted matching with per-image matched-GT sets (correct — avoids cross-image TP assignment bug). Prints per-image tp/fp/fn breakdown. Classes with 0 GT excluded from mAP mean with explicit print notice.
 
-**`app.py`** — Gradio 3-page wizard wrapping the full pipeline. Page 1: crop extraction (calls `extract_crops_labelled.py`). Page 2: pipeline run (calls `auto_annotate.py`, streams log output). Page 3: result gallery. All pipeline parameters exposed as UI controls. `--small-obj-thresh` added to UI this session (was hardcoded at 0.01, now `gr.Number` defaulting to 0.02).
+**`scripts/sam3_dinov2_module.py`** — Pipeline B, SAM3 canvas-composite few-shot production pipeline. No crop-extraction step — works directly off labelled reference images + YOLO labels. DINOv2 diverse-ref selection (farthest-point sampling) → SAM3 canvas-composite exemplar prompting, batched per ref-group → per-target aggregation across all classes/ref-groups → per-class-id containment + duplicate filter → YOLO `.txt` + 2-panel preview + `summary.json` per target.
+
+**`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A (YOLOe→SAM2→DINOv2, needs crop extraction first) or Pipeline B (SAM3→DINOv2, no crop extraction). Page 1: crop extraction (calls `extract_crops_labelled.py`, Pipeline A only). Page 2 / Page 2b: pipeline run (calls `yoloe_sam2_dinov2_module.py` or `sam3_dinov2_module.py`, streams log output). Page 3: shared result gallery + YOLO label download, reads whichever `summary.json` the active run produced. All pipeline parameters exposed as UI controls.
 
 ### Test / debug scripts
 

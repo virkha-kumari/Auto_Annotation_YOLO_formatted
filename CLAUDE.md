@@ -38,8 +38,9 @@ Used across multiple industrial computer vision projects.
 - **WBF consolidated score** — `0.3 × yoloe_conf + 0.7 × dino_sim` per box before WBF fusion.
 - **Pipeline VRAM order** — YOLOe (all targets, batched) → unload → SAM2 (refs + all target proposals) → unload → DINOv2 (embed + score all) → unload → WBF + output.
 - **Batched YOLOe** — outer=stems, inner=target batches. `get_vpe` bakes VPE once per stem, `predict(source=[batch])` runs plain detection on all targets. 2.91× speedup confirmed.
-- **`scripts/auto_annotate.py`** — BUILT AND WORKING. Multi-class, batched, small-obj-aware.
-- **`app.py`** — Gradio 3-page wizard wrapping the full pipeline. WORKING.
+- **`scripts/yoloe_sam2_dinov2_module.py`** (formerly `auto_annotate.py`) — BUILT AND WORKING. Multi-class, batched, small-obj-aware. Pipeline A.
+- **`scripts/sam3_dinov2_module.py`** — BUILT AND WORKING (integrated 2026-07-14). Canvas-composite few-shot, no crop-extraction step, per-target containment+dup filter. Pipeline B. Still missing DINOv2 cosine-sim gate on its own proposals — next step.
+- **`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A or B. WORKING.
 
 ---
 
@@ -47,11 +48,14 @@ Used across multiple industrial computer vision projects.
 
 | Script | What it does | Status |
 |---|---|---|
-| `scripts/auto_annotate.py` | Full pipeline: YOLOe→SAM2→DINOv2→WBF→YOLO .txt | **ACTIVE — working** |
-| `app.py` | Gradio 3-page wizard UI | **ACTIVE — working** |
-| `scripts/extract_crops_labelled.py` | Seed crop extraction with clustering | Active |
+| `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A: YOLOe→SAM2→DINOv2→WBF→YOLO .txt | **ACTIVE — working** |
+| `scripts/sam3_dinov2_module.py` | Pipeline B: SAM3 canvas-composite few-shot→containment/dup filter→YOLO .txt | **ACTIVE — working**, no DINOv2 gate yet |
+| `app.py` | Gradio wizard UI — landing page picks Pipeline A or B | **ACTIVE — working** |
+| `scripts/extract_crops_labelled.py` | Seed crop extraction with clustering (Pipeline A only) | Active |
 | `scripts/extract_crops_varied.py` | Seed crop extraction without clustering | Active |
-| `test/debug_yoloe_sam2_dino.py` | Full pipeline debug, 4-panel matplotlib viz | Active |
+| `scripts/eval_map.py` | mAP/P/R/F1 evaluation vs ground truth | Active |
+| `test/debug_yoloe_sam2_dino.py` | Pipeline A debug, 4-panel matplotlib viz | Active |
+| `test/debug_sam3.py` | Pipeline B debug, 4-panel matplotlib viz per (ref, target) pair | Active |
 | `test/test_yoloe_batch.py` | YOLOe batching benchmark (2.91× confirmed) | Reference |
 | `utils/debug_yoloe.py` | Pure YOLOe visual-prompt debug | Reference |
 | `utils/test_owlv2_dinov2.py` | OWLv2+DINOv2 — dead end | Dead end |
@@ -62,7 +66,7 @@ Used across multiple industrial computer vision projects.
 
 - **No text prompts anywhere** — pipeline is purely visual
 - **Keep outlier clusters** — occluded/unusual views are valid
-- **Monolith first** — keep `auto_annotate.py` as one script until design stabilizes
+- **Monolith first** — keep each pipeline module (`scripts/yoloe_sam2_dinov2_module.py`, `scripts/sam3_dinov2_module.py`) as one script until design stabilizes
 - **Human review via PIL preview** — no Label Studio or CVAT integration planned
 - **Device-independent code always** — never hardcode cache paths; code must run on any machine
 - **VRAM rule** — never load two large models simultaneously (see below)
@@ -74,12 +78,13 @@ Used across multiple industrial computer vision projects.
 
 | File | Role | Status |
 |---|---|---|
-| `scripts/auto_annotate.py` | Main production pipeline | **ACTIVE** |
-| `app.py` | Gradio UI | **ACTIVE** |
+| `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A production pipeline | **ACTIVE** |
+| `scripts/sam3_dinov2_module.py` | Pipeline B production pipeline (canvas-composite few-shot) | **ACTIVE — integrated into app.py; next: DINOv2 sanity-check gate on proposals** |
+| `app.py` | Gradio UI, both pipelines | **ACTIVE** |
 | `scripts/extract_crops_labelled.py` | Seed crop extraction (clustered) | FINALIZED |
 | `scripts/extract_crops_varied.py` | Seed crop extraction (all) | FINALIZED |
-| `test/debug_yoloe_sam2_dino.py` | Debug pipeline with 4-panel viz | ACTIVE |
-| `test/debug_sam3.py` | SAM3 canvas-composite few-shot debug (4-panel viz) | **ACTIVE — confirmed working end-to-end; next: DINOv2 sanity-check score per proposal, then integrate into app.py/auto_annotate.py** |
+| `test/debug_yoloe_sam2_dino.py` | Pipeline A debug with 4-panel viz | ACTIVE |
+| `test/debug_sam3.py` | Pipeline B debug, 4-panel viz per (ref, target) pair | ACTIVE |
 | `requirements.txt` | Python deps (PyTorch CUDA 11.8, transformers, etc.) | Exists |
 
 ---
@@ -92,7 +97,7 @@ Used across multiple industrial computer vision projects.
 | SAM2 | Masked crop producer (not proposer) | `facebook/sam2.1-hiera-base-plus` | **CONFIRMED** for masking — failed as auto-proposer |
 | DINOv2 | Embedding + cosine sim scoring | `facebook/dinov2-base` | **CONFIRMED** — masked patch pooling (normal) + CLS (small) |
 | SAM3 | Region proposal (unprompted auto-mask) | `facebook/sam3` | Failed — same issue as SAM2 |
-| SAM3 | Cross-image few-shot (canvas-composite exemplar, `test/debug_sam3.py`) | `facebook/sam3` | **CONFIRMED working end-to-end** on real multi-class dataset. No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Next: add DINOv2 sanity-check scoring per SAM3 proposal (cosine sim vs ref crop, same pattern as YOLOe+DINOv2), then integrate into `app.py`/`scripts/auto_annotate.py`. |
+| SAM3 | Cross-image few-shot (canvas-composite exemplar, `scripts/sam3_dinov2_module.py`) | `facebook/sam3` | **CONFIRMED working end-to-end, integrated as Pipeline B** in `app.py` (2026-07-14). No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Current filtering is containment + duplicate suppression only — no DINOv2 similarity gate yet. Next: add DINOv2 sanity-check scoring per SAM3 proposal (cosine sim vs ref crop, same pattern as YOLOe+DINOv2). |
 | OWLv2 | Image-guided detection | `google/owlv2-base-patch16-ensemble` | Dead end — cannot detect large objects |
 
 Cached at `C:/Users/Lenovo/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.

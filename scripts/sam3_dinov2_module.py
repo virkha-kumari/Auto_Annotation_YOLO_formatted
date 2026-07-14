@@ -25,7 +25,7 @@ sample of N diverse refs per class (0 = all), saved to output_dir/temp_refs/
 for inspection (DINOv2 loaded/unloaded before SAM3, VRAM rule).
 
 Usage:
-    python test/debug_sam3.py \\
+    python scripts/sam3_dinov2_module.py \\
         --refs-dir    "D:/path/to/labelled_ref_images" \\
         --refs-labels "D:/path/to/labelled_ref_images"  (YOLO .txt, same stem) \\
         --class-ids   0 1 2 \\
@@ -34,6 +34,8 @@ Usage:
 
 import argparse
 import gc
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -196,8 +198,12 @@ def select_diverse_refs(ref_boxes_by_class: dict, max_refs: int, output_dir: Pat
     dproc = dmodel = None
     if needs_selection:
         print("[refs] Loading DINOv2 for diverse ref selection ...")
-        dproc = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-        dmodel = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
+        try:
+            dproc = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+            dmodel = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
+        except OSError:
+            dproc = AutoImageProcessor.from_pretrained("facebook/dinov2-base", local_files_only=True)
+            dmodel = AutoModel.from_pretrained("facebook/dinov2-base", local_files_only=True).to(device).eval()
 
     selected_by_class = {}
     with torch.no_grad():
@@ -310,77 +316,14 @@ def mask_to_bbox(mask: np.ndarray) -> list[int] | None:
     return [int(x1), int(y1), int(x2), int(y2)]
 
 
-def save_step_figure(canvas, ref_boxes_canvas_xyxy, raw_mask_canvas, raw_boxes_canvas, raw_scores_canvas,
-                      target_img, pred_mask_target, pred_boxes_target, pred_scores_target,
-                      ref_name, target_name, output_path):
-    # OO API (Figure, not pyplot) — no global state, safe to call from worker threads
-    fig = Figure(figsize=(32, 8))
-    axes = fig.subplots(1, 4)
-
-    axes[0].imshow(canvas)
-    for x1, y1, x2, y2 in ref_boxes_canvas_xyxy:
-        axes[0].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                           linewidth=2, edgecolor="lime", facecolor="none"))
-    axes[0].set_title(f"Canvas: ref={ref_name}  target={target_name}\n"
-                       f"(green box(es) = {len(ref_boxes_canvas_xyxy)} exemplar prompt(s))", fontsize=9)
-    axes[0].axis("off")
-
-    axes[1].imshow(canvas)
-    axes[1].imshow(raw_mask_canvas, alpha=0.5, cmap="jet")
-    for box, score in zip(raw_boxes_canvas, raw_scores_canvas):
-        x1, y1, x2, y2 = box
-        axes[1].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                           linewidth=2, edgecolor="yellow", facecolor="none"))
-        axes[1].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="yellow", fontsize=8,
-                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
-    axes[1].set_title(f"Raw SAM3 prediction on full canvas\n({len(raw_boxes_canvas)} box(es), yellow = SAM3 boxes)", fontsize=9)
-    axes[1].axis("off")
-
-    axes[2].imshow(target_img)
-    if pred_mask_target is not None:
-        axes[2].imshow(pred_mask_target, alpha=0.5, cmap="jet")
-    for box, score in zip(pred_boxes_target, pred_scores_target):
-        x1, y1, x2, y2 = box
-        axes[2].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                           linewidth=2, edgecolor="cyan", facecolor="none"))
-        axes[2].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="cyan", fontsize=8,
-                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
-    scores_str = ", ".join(f"{s:.2f}" for s in pred_scores_target) or "-"
-    axes[2].set_title(f"Cropped back to target\n({len(pred_boxes_target)} instance(s), scores: {scores_str})", fontsize=9)
-    axes[2].axis("off")
-
-    axes[3].imshow(target_img)
-    for box, score in zip(pred_boxes_target, pred_scores_target):
-        x1, y1, x2, y2 = box
-        axes[3].add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                           linewidth=2, edgecolor="orange", facecolor="none"))
-        axes[3].text(x1, max(y1 - 4, 0), f"{score:.2f}", color="orange", fontsize=8,
-                      bbox=dict(facecolor="black", alpha=0.5, pad=1))
-    max_score_str = f"{max(pred_scores_target):.2f}" if pred_scores_target else "-"
-    axes[3].set_title(f"Tightened bbox only, per instance ({len(pred_boxes_target)})\nmax score: {max_score_str}", fontsize=9)
-    axes[3].axis("off")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=120, bbox_inches="tight")
-    print(f"[saved] {output_path}")
-
-
-def process_result(canvas, placements, ref_boxes_canvas_xyxy, target_img, masks_canvas,
-                    scores_canvas, boxes_canvas, ref_name, target_name, out_path):
-    ch_cw = placements["canvas_size"]
-    cw, ch = ch_cw
-
-    raw_mask_canvas = np.zeros((ch, cw), dtype=np.uint8)
-    for m in masks_canvas:
-        raw_mask_canvas |= m
-
+def crop_result_to_target(placements, masks_canvas, scores_canvas, class_id):
+    """Crop one batch's canvas-space masks/scores back to target-image space. Returns list of dicts:
+    {box: [x1,y1,x2,y2] px, score: float, class_id: int}."""
     tgt = placements["tgt"]
     tx, ty = tgt["offset"]
     tw, th = tgt["curr_size"]
 
-    pred_masks_target = []
-    pred_boxes_target = []
-    pred_scores_target = []
+    out = []
     for m, score in zip(masks_canvas, scores_canvas):
         crop = m[ty:ty + th, tx:tx + tw]
         if not crop.any():
@@ -391,27 +334,114 @@ def process_result(canvas, placements, ref_boxes_canvas_xyxy, target_img, masks_
         box = mask_to_bbox(mask_target)
         if box is None:
             continue
-        pred_masks_target.append(mask_target)
-        pred_boxes_target.append(box)
-        pred_scores_target.append(score)
+        out.append({"box": [float(v) for v in box], "score": float(score), "class_id": class_id})
+    return out
 
-    if pred_scores_target:
-        scores_log = ", ".join(f"{s:.3f}" for s in pred_scores_target)
-        print(f"  [scores] {len(pred_scores_target)} instance(s): {scores_log}")
-    else:
-        print("  [scores] no instances passed into target region")
 
-    combined_mask_target = None
-    if pred_masks_target:
-        combined_mask_target = np.zeros_like(pred_masks_target[0])
-        for m in pred_masks_target:
-            combined_mask_target |= m
+def box_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0, 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    iou = inter / union if union > 0 else 0.0
+    containment = inter / min(area_a, area_b) if min(area_a, area_b) > 0 else 0.0
+    return iou, containment
 
-    save_step_figure(
-        canvas, ref_boxes_canvas_xyxy, raw_mask_canvas, boxes_canvas, scores_canvas,
-        target_img, combined_mask_target, pred_boxes_target, pred_scores_target,
-        ref_name, target_name, out_path,
-    )
+
+def filter_containment_duplicates(dets: list[dict], containment_thresh: float, iou_thresh: float) -> tuple[list[dict], list[dict]]:
+    """Per-class-id containment + duplicate filter. dets already restricted to one class.
+    Sort by score desc; a lower-score box dies if it's contained in (containment>=thresh) or
+    a near-duplicate of (iou>=thresh) an already-kept higher-score box. Returns (kept, rejected)."""
+    order = sorted(range(len(dets)), key=lambda i: dets[i]["score"], reverse=True)
+    kept_idx = []
+    rejected_idx = []
+    for i in order:
+        box_i = dets[i]["box"]
+        suppressed = False
+        for j in kept_idx:
+            iou, containment = box_iou(box_i, dets[j]["box"])
+            if containment >= containment_thresh or iou >= iou_thresh:
+                suppressed = True
+                break
+        if suppressed:
+            rejected_idx.append(i)
+        else:
+            kept_idx.append(i)
+    kept = [dets[i] for i in kept_idx]
+    rejected = [dets[i] for i in rejected_idx]
+    return kept, rejected
+
+
+# tab10 cycle, indexed by class_id % 10 — stable color per class across both panels
+CLASS_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def class_color(class_id: int) -> str:
+    return CLASS_COLORS[class_id % len(CLASS_COLORS)]
+
+
+def _draw_box(ax, d: dict, linestyle="solid"):
+    x1, y1, x2, y2 = d["box"]
+    color = class_color(d["class_id"])
+    ax.add_patch(patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                 linewidth=2, edgecolor=color, facecolor="none", linestyle=linestyle))
+    ax.text(x1, max(y1 - 4, 0), f"cls{d['class_id']}:{d['score']:.2f}", color=color, fontsize=8,
+            bbox=dict(facecolor="black", alpha=0.6, pad=1))
+
+
+def save_target_figure(target_img, raw_dets: list[dict], kept_dets: list[dict], rejected_dets: list[dict],
+                        target_name: str, output_path):
+    """2-panel figure per target: left = all raw SAM3 boxes (pre-filter), right = kept(solid)/rejected(dashed)
+    after containment + duplicate removal. Box edge color = class_id (same color both panels)."""
+    fig = Figure(figsize=(16, 8))
+    axes = fig.subplots(1, 2)
+
+    class_ids_present = sorted({d["class_id"] for d in raw_dets})
+    legend_handles = [patches.Patch(edgecolor=class_color(c), facecolor="none", linewidth=2, label=f"cls{c}")
+                       for c in class_ids_present]
+
+    axes[0].imshow(target_img)
+    for d in raw_dets:
+        _draw_box(axes[0], d)
+    axes[0].set_title(f"Raw SAM3 proposals ({len(raw_dets)})", fontsize=10)
+    axes[0].axis("off")
+    if legend_handles:
+        axes[0].legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.7)
+
+    axes[1].imshow(target_img)
+    for d in rejected_dets:
+        _draw_box(axes[1], d, linestyle="dashed")
+    for d in kept_dets:
+        _draw_box(axes[1], d, linestyle="solid")
+    axes[1].set_title(f"After containment + dup filter (solid={len(kept_dets)} kept, dashed={len(rejected_dets)} rejected)", fontsize=10)
+    axes[1].axis("off")
+    if legend_handles:
+        axes[1].legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.7)
+
+    fig.suptitle(target_name, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    print(f"[saved] {output_path}")
+
+
+def write_yolo_txt(kept_dets: list[dict], img_w: int, img_h: int, output_path):
+    lines = []
+    for d in kept_dets:
+        x1, y1, x2, y2 = d["box"]
+        cx = (x1 + x2) / 2 / img_w
+        cy = (y1 + y2) / 2 / img_h
+        w = (x2 - x1) / img_w
+        h = (y2 - y1) / img_h
+        lines.append(f"{d['class_id']} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
 def parse_args():
@@ -443,9 +473,14 @@ def parse_args():
                     help="Thread pool size for offloaded figure rendering/saving.")
     p.add_argument("--ref-jpeg-quality", type=int, default=80,
                     help="JPEG quality for saved ref crops in output_dir/temp_refs/.")
+    p.add_argument("--containment-thresh", type=float, default=0.85,
+                    help="Box A inside box B if intersection/min_area >= this -> drop lower-score box.")
+    p.add_argument("--dup-iou-thresh", type=float, default=0.85,
+                    help="Two boxes are duplicates if IoU >= this -> drop lower-score box.")
     return p.parse_args()
 
 def main():
+    t_start = time.time()
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -489,96 +524,133 @@ def main():
 
     dtype = torch.float32 if (args.fp32 or device != "cuda") else torch.bfloat16
     print(f"[model] Loading SAM3: {SAM3_MODEL_ID} ({dtype}) ...")
-    model = Sam3Model.from_pretrained(SAM3_MODEL_ID, torch_dtype=dtype, device_map=device)
-    processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+    try:
+        model = Sam3Model.from_pretrained(SAM3_MODEL_ID, torch_dtype=dtype, device_map=device)
+        processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+    except OSError:
+        model = Sam3Model.from_pretrained(SAM3_MODEL_ID, torch_dtype=dtype, device_map=device, local_files_only=True)
+        processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID, local_files_only=True)
 
-    total = sum(len(groups) for groups in ref_instances_by_class.values()) * len(target_paths)
+    ref_pairs = [(class_id, rg) for class_id, groups in ref_instances_by_class.items() for rg in groups]
+    total = len(ref_pairs) * len(target_paths)
     done = 0
     batch_size = args.batch_size
-    # Offload CPU-bound figure rendering so GPU keeps working
+
+    # Per-target accumulation across ALL classes/ref_groups: target_path -> list[det dict]
+    dets_by_target: dict[Path, list[dict]] = {p: [] for p in target_paths}
+
+    # Targets outer, (class, ref_group) inner — each target batch decoded+resized ONCE
+    # and reused across every ref_group/class, instead of once per (class, ref_group) pair.
+    for batch_start in range(0, len(target_paths), batch_size):
+        batch_paths = target_paths[batch_start:batch_start + batch_size]
+        batch_target_imgs = {p: Image.open(p).convert("RGB") for p in batch_paths}
+
+        for class_id, ref_group in ref_pairs:
+            print(f"\n[class={class_id} ref_group={ref_group['names']}] "
+                  f"batch {batch_start // batch_size + 1} "
+                  f"({len(batch_paths)} target(s): {', '.join(p.name for p in batch_paths)})")
+
+            canvases, placements_list = [], []
+            for target_path in batch_paths:
+                canvas, placements = create_canvas(
+                    ref_group["image"], ref_group["boxes"], batch_target_imgs[target_path],
+                    args.canvas_size, args.orientation, args.split_ratio,
+                )
+                canvases.append(canvas)
+                placements_list.append(placements)
+
+            inputs = processor(
+                images=canvases,
+                input_boxes=[[norm_cxcywh_to_xyxy_px(nb, *pl["canvas_size"]) for nb in get_norm_boxes(pl)] for pl in placements_list],
+                input_boxes_labels=[[1] * len(ref_group["boxes"]) for _ in canvases],
+                return_tensors="pt",
+            ).to(model.device)
+            inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
+            if "input_boxes" in inputs:
+                inputs["input_boxes"] = inputs["input_boxes"].to(model.dtype)
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            results_list = processor.post_process_instance_segmentation(
+                outputs,
+                threshold=args.threshold,
+                mask_threshold=args.mask_threshold,
+                target_sizes=inputs.get("original_sizes").tolist(),
+            )
+
+            for target_path, placements, results in zip(batch_paths, placements_list, results_list):
+                done += 1
+                print(f"  [{done}/{total}] target={target_path.name}")
+
+                # .to(uint8) before .numpy() — numpy has no bf16 dtype
+                masks_canvas = [m.to(torch.uint8).cpu().numpy() for m in results["masks"]]
+                scores_canvas = [float(s) for s in results["scores"]]
+
+                dets = crop_result_to_target(placements, masks_canvas, scores_canvas, class_id)
+                if dets:
+                    print(f"  [scores] {len(dets)} instance(s): " + ", ".join(f"{d['score']:.3f}" for d in dets))
+                else:
+                    print("  [scores] no instances passed into target region")
+                dets_by_target[target_path].extend(dets)
+
+            del inputs, outputs
+            ram_guard()
+
+    del model, processor
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # Per-target: containment + duplicate filter (per class_id), write YOLO txt, save 2-panel fig.
+    labels_dir = output_dir / "labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
     save_pool = ThreadPoolExecutor(max_workers=args.save_workers)
     save_futures = []
-    max_pending_saves = args.save_workers * 4  # drain periodically: bound memory, surface worker errors promptly
-    for class_id, ref_groups in ref_instances_by_class.items():
-        for ref_group in ref_groups:
-            # Cap tag length (Windows MAX_PATH)
-            names = ref_group["names"]
-            tag_suffix = names[0] if len(names) == 1 else f"{names[0]}+{len(names) - 1}more"
-            ref_tag = f"cls{class_id}_{tag_suffix}"
-            for batch_start in range(0, len(target_paths), batch_size):
-                batch_paths = target_paths[batch_start:batch_start + batch_size]
-                print(f"\n[class={class_id} ref_group={ref_group['names']}] "
-                      f"batch {batch_start // batch_size + 1} "
-                      f"({len(batch_paths)} target(s): {', '.join(p.name for p in batch_paths)})")
+    max_pending_saves = args.save_workers * 4
+    summary = {}
+    for target_path in target_paths:
+        raw_dets = dets_by_target[target_path]
+        kept_all, rejected_all = [], []
+        for class_id in sorted({d["class_id"] for d in raw_dets}):
+            class_dets = [d for d in raw_dets if d["class_id"] == class_id]
+            kept, rejected = filter_containment_duplicates(class_dets, args.containment_thresh, args.dup_iou_thresh)
+            kept_all.extend(kept)
+            rejected_all.extend(rejected)
 
-                # Decode only this batch's targets — freed at end of the batch iteration
-                batch_target_imgs = {p: Image.open(p).convert("RGB") for p in batch_paths}
-                canvases, placements_list, ref_box_xyxys_list = [], [], []
-                for target_path in batch_paths:
-                    canvas, placements = create_canvas(
-                        ref_group["image"], ref_group["boxes"], batch_target_imgs[target_path],
-                        args.canvas_size, args.orientation, args.split_ratio,
-                    )
-                    norm_boxes = get_norm_boxes(placements)
-                    cw, ch = placements["canvas_size"]
-                    box_xyxys = [norm_cxcywh_to_xyxy_px(nb, cw, ch) for nb in norm_boxes]
-                    canvases.append(canvas)
-                    placements_list.append(placements)
-                    ref_box_xyxys_list.append(box_xyxys)
+        with Image.open(target_path) as img:
+            img_w, img_h = img.size
+        label_path = labels_dir / f"{target_path.stem}.txt"
+        write_yolo_txt(kept_all, img_w, img_h, label_path)
 
-                inputs = processor(
-                    images=canvases,
-                    input_boxes=ref_box_xyxys_list,
-                    input_boxes_labels=[[1] * len(b) for b in ref_box_xyxys_list],
-                    return_tensors="pt",
-                ).to(model.device)
-                inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
-                if "input_boxes" in inputs:
-                    inputs["input_boxes"] = inputs["input_boxes"].to(model.dtype)
+        target_img = Image.open(target_path).convert("RGB")
+        out_path = output_dir / f"{target_path.stem}.png"
+        save_futures.append(save_pool.submit(
+            save_target_figure, target_img, raw_dets, kept_all, rejected_all, target_path.name, out_path,
+        ))
 
-                with torch.no_grad():
-                    outputs = model(**inputs)
+        summary[target_path.name] = {
+            "label_file": str(label_path.resolve()),
+            "preview_file": str(out_path.resolve()),
+            "n_final_total": len(kept_all),
+        }
 
-                results_list = processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=args.threshold,
-                    mask_threshold=args.mask_threshold,
-                    target_sizes=inputs.get("original_sizes").tolist(),
-                )
-
-                for target_path, canvas, placements, ref_box_xyxys, results in zip(
-                    batch_paths, canvases, placements_list, ref_box_xyxys_list, results_list
-                ):
-                    done += 1
-                    print(f"  [{done}/{total}] target={target_path.name}")
-
-                    # .to(uint8) before .numpy() — numpy has no bf16 dtype
-                    masks_canvas = [m.to(torch.uint8).cpu().numpy() for m in results["masks"]]
-                    scores_canvas = [float(s) for s in results["scores"]]
-                    boxes_canvas = [b.float().cpu().numpy().tolist() for b in results["boxes"]]
-
-                    out_path = output_dir / f"{target_path.stem}__{ref_tag}.png"
-                    save_futures.append(save_pool.submit(
-                        process_result,
-                        canvas, placements, ref_box_xyxys, batch_target_imgs[target_path],
-                        masks_canvas, scores_canvas, boxes_canvas,
-                        ref_tag, target_path.name, out_path,
-                    ))
-
-                del inputs, outputs
-                ram_guard()
-
-                if len(save_futures) >= max_pending_saves:
-                    for f in save_futures:
-                        f.result()   # re-raise any worker exception promptly
-                    save_futures.clear()
+        if len(save_futures) >= max_pending_saves:
+            for f in save_futures:
+                f.result()
+            save_futures.clear()
+        ram_guard()
 
     print("\n[save] waiting for remaining figure saves to finish ...")
     for f in save_futures:
         f.result()
     save_pool.shutdown()
 
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"[saved] {output_dir / 'summary.json'}")
+
+    elapsed = time.time() - t_start
     print(f"\n[done] Output -> {output_dir.resolve()}")
+    print(f"[time] total runtime: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
 
 if __name__ == "__main__":
