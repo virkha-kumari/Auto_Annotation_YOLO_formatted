@@ -57,6 +57,49 @@ mAP averaged over 7 classes with GT present. Classes with 0 GT excluded per COCO
 
 ---
 
+## Results — Construction-PPE dataset - Pipeline B (SAM3)
+
+Dataset: same Construction-PPE source images. Eval on a **different, larger test set** than Pipeline A above — 150-image stratified sample (`data/test/`, moved out of `data/label/`) covering all 11 classes, including the `no_*` negative-state classes that had 0 GT in Pipeline A's 50-image eval split. **Numbers below are not directly comparable to Pipeline A's table above** — different image count, different class coverage. A same-set comparison needs Pipeline A re-run on `data/test/` too.
+
+**Command:** `python scripts/eval_map.py --preds output_sam3_dinov2_ppe/labels --gt data/test --images data/test --classes helmet gloves vest boots goggles none Person no_helmet no_goggle no_gloves no_boots`
+
+| Class | Prec | Rec | F1 | AP@.50 | AP@.5:.95 | nPred | nGT |
+|---|---|---|---|---|---|---|---|
+| helmet (cls0) | 0.483 | 0.807 | 0.604 | 0.422 | 0.140 | 286 | 171 |
+| gloves (cls1) | 0.306 | 0.500 | 0.379 | 0.163 | 0.039 | 252 | 154 |
+| vest (cls2) | 0.262 | 0.455 | 0.332 | 0.174 | 0.046 | 233 | 134 |
+| boots (cls3) | 0.245 | 0.307 | 0.273 | 0.128 | 0.033 | 208 | 166 |
+| goggles (cls4) | 0.161 | 0.364 | 0.223 | 0.103 | 0.022 | 124 | 55 |
+| none (cls5) | 0.082 | 0.195 | 0.115 | 0.030 | 0.007 | 208 | 87 |
+| Person (cls6) | 0.665 | 0.797 | 0.725 | 0.570 | 0.218 | 266 | 222 |
+| no_helmet (cls7) | 0.059 | 0.143 | 0.084 | 0.022 | 0.004 | 135 | 56 |
+| no_goggle (cls8) | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 224 | 45 |
+| no_gloves (cls9) | 0.050 | 0.013 | 0.020 | 0.003 | 0.001 | 20 | 79 |
+| no_boots (cls10) | 0.004 | 0.038 | 0.007 | 0.001 | 0.000 | 540 | 53 |
+| **mAP@.50** | | | | **0.147** | **0.046** | 2496 | 1222 |
+
+mAP averaged over all 11 classes (all have GT present in this 150-image set).
+
+**What works:**
+- **Person (cls6):** 0.725 F1, AP=0.570 — best class, consistent with Pipeline A.
+- **Helmet (cls0):** 0.604 F1 — high recall (0.807) but precision only 0.483, more FPs than Pipeline A's helmet result.
+
+**What's hard:**
+- **`no_boots` (cls10):** prec=0.004 — 540 preds for 53 GT, near-total FP flood. SAM3 canvas-composite proposals have no similarity gate yet (see Pipeline B status below) — this is the clearest symptom of that missing filter.
+- **`no_goggle` (cls9):** 0 TP at all — 224 preds, all FP.
+- **Negative-state classes generally weak** (`no_helmet`, `no_goggle`, `no_gloves`, `no_boots`): these classes are defined by *absence* of a visual feature, which is a poor match for SAM3's exemplar-based few-shot matching — same fundamental issue as `none` in Pipeline A.
+- **No DINOv2 cosine-sim gate on SAM3 proposals yet** — current filtering is containment + duplicate suppression only. The FP-flood classes above are the direct evidence this gate is needed next.
+
+### Sample outputs
+
+*2-panel preview: left = all raw SAM3 proposals color-coded by class, right = kept (solid) vs rejected (dashed) after containment+dup filter.*
+
+| image639 (47 final boxes) | image1206 (41 final boxes) |
+|---|---|
+| ![image639](docs/images/image639_sam3_preview.png) | ![image1206](docs/images/image1206_sam3_preview.png) |
+
+---
+
 ## Known Limitations
 
 - **Visually non-distinctive classes fail** — if the class has high appearance variance (gloves, hands, small tools) and low inter-class contrast, DINOv2 similarity scores spread across a wide range and any threshold is a tradeoff. No clean cutoff exists.

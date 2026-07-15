@@ -7,11 +7,21 @@ Format:
 
 ---
 
+## 2026-07-15
+
+### ADDED — `data/test/`: 150-image stratified eval split shared by both pipelines
+
+Moved 150 image+label pairs out of `data/label/` into `data/test/` (flat layout, matches source). Stratified selection: greedy min-15-images/class floor across all 11 classes (rarest first), remainder filled random up to 150. Final coverage: all 11 classes present, 16–143 images/class (`no_boots`/cls10 rarest at 16 of its 36 total, `Person`/cls6 most common at 143). `data/label/` is now the remaining train/seed pool (2,542 files). Purpose: a fixed shared set so Pipeline A and Pipeline B mAP numbers are directly comparable — Pipeline A's existing README table is from an older, different 50-image/7-class split, not this one.
+
+### FINDING — Pipeline B (SAM3) mAP@.50=0.147 on `data/test/` (150 img, 11 classes)
+
+Ran `scripts/eval_map.py` against `output_sam3_dinov2_ppe/` (existing SAM3 pipeline run) vs new `data/test/` ground truth. mAP@.50=0.147, mAP@.5:.95=0.046. Person best (F1=0.725, AP=0.570), helmet second (F1=0.604, high recall 0.807 but precision only 0.483). Negative-state classes (`no_boots`: 540 preds for 53 GT, prec=0.004; `no_goggle`: 0 TP out of 224 preds) are the worst offenders — direct evidence the pipeline needs the DINOv2 sim gate it's still missing (containment/dup filter alone doesn't reject appearance-mismatched proposals). Results added to README as a separate section, explicitly flagged as not-yet-comparable to Pipeline A's table (different image count/class set) until Pipeline A is also re-run on `data/test/`.
+
+Note: `eval_map.py`'s `load_summary_scores()` expects `summary.json` in the same dir as the predicted `.txt` files; Pipeline B writes `summary.json` at output root but labels under `output_dir/labels/`. Copied `summary.json` into `output_sam3_dinov2_ppe/labels/` as a workaround for this eval run — `sam3_dinov2_module.py` itself untouched.
+
+---
+
 ## 2026-07-14
-
-### ADDED — VOC test set for SAM3 mAP eval (150 images, `data/VoC full data/test/`)
-
-Built a stratified 150-image test split from the full 4952-image VOC set (already YOLO-converted, `scripts/voc_xml_to_yolo.py`) to run `scripts/sam3_dinov2_module.py` + `scripts/eval_map.py` against. Two-phase selection: (1) coverage floor of 5 images/class across all 20 VOC classes, multi-object-priority within each class's candidate pool; (2) remaining budget filled with the overall most multi-object/multi-class images. Result: all 20 classes represented (5–133 images/class, person/car/diningtable naturally dominant — matches VOC's real co-occurrence distribution, not an artifact). Copy-only, source `data/VoC full data/` untouched. Not yet run through the pipeline.
 
 ### ADDED — `scripts/sam3_dinov2_module.py`: per-target aggregation, containment+dup filter, 2-panel preview
 

@@ -65,7 +65,7 @@ seed crops: <stem>_cls<id>_<idx>.jpg  (naming enables source reverse-resolution)
 |---|---|---|
 | SAM2 auto mask generation | ❌ Dead end | No proposals on large uniform regions. SAM2 needs texture contrast. |
 | SAM3 auto mask generation (unprompted) | ❌ Dead end | Same as SAM2. |
-| SAM3 canvas-composite few-shot (`scripts/sam3_dinov2_module.py`, Pipeline B) | ✅ **Confirmed working, integrated into `app.py`** — next: DINOv2 sanity-check gate | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Per-target aggregation across all classes/ref-groups, per-class-id containment + duplicate filter, YOLO `.txt` + 2-panel preview + `summary.json` per target. Integrated as a second wizard path in `app.py` (2026-07-14) — no crop-extraction step needed, works directly off labelled reference images. **Next:** add DINOv2 cosine-sim sanity check per SAM3 proposal vs ref crop (same scoring pattern as YOLOe pipeline) — currently only containment/duplicate suppression, no appearance-similarity gate. See `docs/log.md` 2026-07-10 and 2026-07-14. |
+| SAM3 canvas-composite few-shot (`scripts/sam3_dinov2_module.py`, Pipeline B) | ✅ **Confirmed working, integrated into `app.py`, mAP eval run** — next: DINOv2 sanity-check gate | No native cross-image exemplar API, so ref+target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt, prediction cropped back to target. Per-target aggregation across all classes/ref-groups, per-class-id containment + duplicate filter, YOLO `.txt` + 2-panel preview + `summary.json` per target. Integrated as a second wizard path in `app.py` (2026-07-14) — no crop-extraction step needed, works directly off labelled reference images. mAP@.50=0.147 on 150-img/11-class `data/test/` split (2026-07-15) — Person best (F1=0.725), negative-state classes (`no_boots`, `no_goggle`) FP-flooded, confirming missing sim gate. **Next:** add DINOv2 cosine-sim sanity check per SAM3 proposal vs ref crop (same scoring pattern as YOLOe pipeline). See `docs/log.md` 2026-07-10, 2026-07-14, 2026-07-15. |
 | OWLv2 image-guided detection | ❌ Dead end | Patch-based ViT — tile-level texture matching. Cannot compose bbox larger than one tile. Tested at 640/1008/1280px. |
 | YOLOe visual-prompt detection | ✅ Confirmed | Multi-scale FPN detects at all scales. Works at conf≥0.06. |
 
@@ -98,11 +98,10 @@ Designed for OWLv2 (compare source scene to target via DINOv2 sim, filter noisy 
 - [ ] **DINOv2 threshold calibration** — `--dino-thresh` 0.65 confirmed for helmet/vest. Needs tuning per dataset per class. Check `X/N passed dino-thresh` in logs.
 - [ ] **WBF score weights** — `0.3×yoloe + 0.7×dino` chosen empirically. Not validated.
 - [ ] **Small-object threshold** — `--small-obj-thresh` 0.02 auto-detects gloves (0.007) and helmets (0.012) as small. May be too aggressive for datasets where helmets are large.
-- [ ] **mAP evaluation** — pipeline output vs Construction-PPE ground truth not yet run.
+- [x] **mAP evaluation** — Pipeline A run on 50-img/7-class split (README), Pipeline B run on new 150-img/11-class `data/test/` split (README). Not yet a same-set comparison — Pipeline A needs re-run on `data/test/` for apples-to-apples numbers.
 - [ ] **Scale to 5K targets** — ~3s/target × 162 stems × 625 chunks = needs profiling at scale.
 - [ ] **Prototype bank size effect** — 200+ ref crops per class vs 20 — does more help or hurt?
 - [ ] **SAM3 proposal sanity check** — add DINOv2 cosine-sim scoring per SAM3 canvas-composite proposal (vs ref crop), same pattern as YOLOe→SAM2→DINOv2. `scripts/sam3_dinov2_module.py` is integrated into `app.py` but still has no appearance-similarity gate, only containment/duplicate suppression.
-- [ ] **SAM3 mAP eval on VOC** — 150-image stratified test set built (`data/VoC full data/test/`, all 20 classes covered, multi-object images prioritized) but not yet run through `scripts/sam3_dinov2_module.py` + `scripts/eval_map.py`.
 
 ---
 
@@ -130,6 +129,8 @@ Split for pipeline eval:
 - `valid/` (143 images) → seed crops (human-annotated)
 - `train/` (1,132 images) → unlabeled targets
 - Ground truth exists for `train/` → mAP eval possible
+
+**`data/test/` (2026-07-15)** — 150-image stratified sample moved out of `data/label/` (min 15 images/class floor, all 11 classes covered, rare `no_boots`/cls10 boosted from 36→16 images since it only had 115 GT instances total). Purpose: shared eval set so Pipeline A and Pipeline B mAP results are comparable on identical images — Pipeline A's existing README numbers are from an older, different 50-image/7-class split and are NOT the same set. `data/label/` now the remaining train/seed pool (2,542 files).
 
 ---
 
