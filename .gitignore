@@ -3,6 +3,7 @@
 crop*/
 *.pt
 *.png
+*.jpeg
 *.jpg
 !docs/images/*.jpg
 !docs/images/*.png

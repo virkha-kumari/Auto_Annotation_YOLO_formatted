@@ -71,17 +71,30 @@ def load_yolo_txt(path: Path) -> list[tuple]:
 
 
 def load_summary_scores(summary_path: Path) -> dict[str, dict[int, list[float]]]:
-    """Returns {stem: {cls_id: [score, ...]}} from auto_annotate summary.json."""
+    """Returns {stem: {cls_id: [score, ...]}} from a pipeline's summary.json.
+
+    Pipeline A shape: {stem: {"classes": {cls_str: {"boxes": [{"score": ...}, ...]}}}}
+    Pipeline B shape: {stem: {"boxes": [{"class_id": ..., "combined_score": ...}, ...]}} (flat, no "classes"
+    nesting) — score is combined_score (0.2*sam3_score + 0.8*dino_sim, the same value the pipeline's own
+    gate ranks/drops on), not sam3_score alone, since sam3_score is raw objectness/mask-quality, not
+    class-discriminative."""
     if not summary_path.exists():
         return {}
     data = json.loads(summary_path.read_text())
     out: dict[str, dict[int, list[float]]] = {}
     for img_name, info in data.items():
         stem = Path(img_name).stem
-        out[stem] = {
-            int(cls_str): [b["score"] for b in cls_info.get("boxes", [])]
-            for cls_str, cls_info in info.get("classes", {}).items()
-        }
+        if "classes" in info:
+            out[stem] = {
+                int(cls_str): [b["score"] for b in cls_info.get("boxes", [])]
+                for cls_str, cls_info in info.get("classes", {}).items()
+            }
+        else:
+            by_cls: dict[int, list[float]] = {}
+            for b in info.get("boxes", []):
+                score = b.get("combined_score")
+                by_cls.setdefault(b["class_id"], []).append(score if score is not None else 0.0)
+            out[stem] = by_cls
     return out
 
 

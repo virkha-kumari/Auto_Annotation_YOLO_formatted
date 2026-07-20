@@ -13,7 +13,7 @@ Used across multiple industrial computer vision projects.
 | File | Purpose |
 |---|---|
 | `README.md` | Full project overview, ablation, quick start, parameters |
-| `docs/notes.md` | Pipeline design decisions, open questions, dataset overview |
+| `docs/plans.md` | What to do next — forward-looking only |
 | `docs/log.md` | Chronological log — ADDED features, DROPPED approaches, FINDINGS with reasons |
 
 **Always update `docs/log.md`** when:
@@ -39,7 +39,7 @@ Used across multiple industrial computer vision projects.
 - **Pipeline VRAM order** — YOLOe (all targets, batched) → unload → SAM2 (refs + all target proposals) → unload → DINOv2 (embed + score all) → unload → WBF + output.
 - **Batched YOLOe** — outer=stems, inner=target batches. `get_vpe` bakes VPE once per stem, `predict(source=[batch])` runs plain detection on all targets. 2.91× speedup confirmed.
 - **`scripts/yoloe_sam2_dinov2_module.py`** (formerly `auto_annotate.py`) — BUILT AND WORKING. Multi-class, batched, small-obj-aware. Pipeline A.
-- **`scripts/sam3_dinov2_module.py`** — BUILT AND WORKING (integrated 2026-07-14). Canvas-composite few-shot, no crop-extraction step, per-target containment+dup filter. Pipeline B. Still missing DINOv2 cosine-sim gate on its own proposals — next step.
+- **`scripts/sam3_dinov2_module.py`** — BUILT AND WORKING (integrated 2026-07-14). Canvas-composite few-shot, no crop-extraction step. Order: SAM3 proposals → combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) → containment+dup filter. Pipeline B. DINOv2 scoring now masked-patch pooling (SAM3's own masks reused for proposals; ref crops box-prompted through SAM3 too) + max-sim vs proto bank, matching Pipeline A's approach — same small-object CLS fallback (`--small-obj-thresh`) (2026-07-20).
 - **`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A or B. WORKING.
 
 ---
@@ -49,7 +49,7 @@ Used across multiple industrial computer vision projects.
 | Script | What it does | Status |
 |---|---|---|
 | `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A: YOLOe→SAM2→DINOv2→WBF→YOLO .txt | **ACTIVE — working** |
-| `scripts/sam3_dinov2_module.py` | Pipeline B: SAM3 canvas-composite few-shot→containment/dup filter→YOLO .txt | **ACTIVE — working**, no DINOv2 gate yet |
+| `scripts/sam3_dinov2_module.py` | Pipeline B: SAM3 canvas-composite few-shot→DINOv2 masked-patch max-sim gate→containment/dup filter→YOLO .txt | **ACTIVE — working** |
 | `app.py` | Gradio wizard UI — landing page picks Pipeline A or B | **ACTIVE — working** |
 | `scripts/extract_crops_labelled.py` | Seed crop extraction with clustering (Pipeline A only) | Active |
 | `scripts/extract_crops_varied.py` | Seed crop extraction without clustering | Active |
@@ -57,8 +57,9 @@ Used across multiple industrial computer vision projects.
 | `test/debug_yoloe_sam2_dino.py` | Pipeline A debug, 4-panel matplotlib viz | Active |
 | `test/debug_sam3.py` | Pipeline B debug, 4-panel matplotlib viz per (ref, target) pair | Active |
 | `test/test_yoloe_batch.py` | YOLOe batching benchmark (2.91× confirmed) | Reference |
-| `utils/debug_yoloe.py` | Pure YOLOe visual-prompt debug | Reference |
-| `utils/test_owlv2_dinov2.py` | OWLv2+DINOv2 — dead end | Dead end |
+| `test/debug_yoloe.py` | Pure YOLOe visual-prompt debug | Reference |
+| `test/debug_yoloe_dinov2.py` | YOLOe+DINOv2, 3-panel viz, no SAM2 (predates `debug_yoloe_sam2_dino.py`) | Reference |
+| `test/test_owlv2_dinov2.py` | OWLv2+DINOv2 — dead end | Dead end |
 
 ---
 
@@ -79,7 +80,7 @@ Used across multiple industrial computer vision projects.
 | File | Role | Status |
 |---|---|---|
 | `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A production pipeline | **ACTIVE** |
-| `scripts/sam3_dinov2_module.py` | Pipeline B production pipeline (canvas-composite few-shot) | **ACTIVE — integrated into app.py; next: DINOv2 sanity-check gate on proposals** |
+| `scripts/sam3_dinov2_module.py` | Pipeline B production pipeline (canvas-composite few-shot + combined-score gate) | **ACTIVE — integrated into app.py; smoke-tested only, full mAP eval pending** |
 | `app.py` | Gradio UI, both pipelines | **ACTIVE** |
 | `scripts/extract_crops_labelled.py` | Seed crop extraction (clustered) | FINALIZED |
 | `scripts/extract_crops_varied.py` | Seed crop extraction (all) | FINALIZED |
@@ -97,7 +98,7 @@ Used across multiple industrial computer vision projects.
 | SAM2 | Masked crop producer (not proposer) | `facebook/sam2.1-hiera-base-plus` | **CONFIRMED** for masking — failed as auto-proposer |
 | DINOv2 | Embedding + cosine sim scoring | `facebook/dinov2-base` | **CONFIRMED** — masked patch pooling (normal) + CLS (small) |
 | SAM3 | Region proposal (unprompted auto-mask) | `facebook/sam3` | Failed — same issue as SAM2 |
-| SAM3 | Cross-image few-shot (canvas-composite exemplar, `scripts/sam3_dinov2_module.py`) | `facebook/sam3` | **CONFIRMED working end-to-end, integrated as Pipeline B** in `app.py` (2026-07-14). No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Current filtering is containment + duplicate suppression only — no DINOv2 similarity gate yet. Next: add DINOv2 sanity-check scoring per SAM3 proposal (cosine sim vs ref crop, same pattern as YOLOe+DINOv2). |
+| SAM3 | Cross-image few-shot (canvas-composite exemplar, `scripts/sam3_dinov2_module.py`) | `facebook/sam3` | **CONFIRMED working end-to-end, integrated as Pipeline B** in `app.py` (2026-07-14). No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Order: combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) first, then containment + duplicate suppression. SAM3 also box-prompted (single-image, own GT box) on ref crops to get masks for DINOv2 scoring — reuses the already-loaded SAM3 instead of a separate SAM2 phase, own-image box-prompt is a different mode from the failed unprompted auto-mask row above. All calibrated 2026-07-20; smoke-tested only, full mAP eval pending. |
 | OWLv2 | Image-guided detection | `google/owlv2-base-patch16-ensemble` | Dead end — cannot detect large objects |
 
 Cached at `C:/Users/Lenovo/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.
@@ -128,15 +129,18 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 8. **Full-crop DINOv2 CLS too noisy** — 0.19–0.43 sims. Switched to masked patch pooling.
 9. **Small objects break masked patch pooling** — cls1 (gloves, area≈0.007) got 0/N passing dino-thresh. 1–2 patches covered → high-variance embedding. Fixed: CLS on raw bbox crop.
 10. **WBF nested box problem** — handled by post-WBF containment filter (intersection/min_area).
+11. **Pipeline B had the same CLS-on-raw-crop noise as finding #8** — SAM3 gives masks but the pipeline only used them for the box (`mask_to_bbox`), never for DINOv2 scoring, so all proposals scored on raw-crop CLS regardless of background clutter. Fixed by reusing SAM3's mask directly (proposals) and box-prompting SAM3 on ref crops too (single-image, own GT box, no canvas) — same masked-patch pooling as Pipeline A, same small-obj CLS fallback. Also switched proto-bank sim from mean to max (best-matching ref), matching Pipeline A.
 
 ---
 
 ## Calibration values (current defaults, all tunable)
 
+### Pipeline A (YOLOe/SAM2/DINOv2)
+
 - YOLOe confidence: `0.06`
 - YOLOe target batch size: `8`
 - DINOv2 cosine similarity threshold (`--dino-thresh`): `0.65`
-- Small object threshold (`--small-obj-thresh`): `0.02` (p90 w×h normalised)
+- Small object threshold (`--small-obj-thresh`): `0.01` (p90 w×h normalised)
 - NMS IoU (`--nms-iou`): `0.45`
 - WBF score gate (`--wbf-score`): `0.10`
 - Result threshold (`--result-thresh`): `0.50`
@@ -145,6 +149,17 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - SAM2 mask padding: `0.05`
 - SAM2 score min: `0.50`
 - SAM2 area min: `0.10`
+
+### Pipeline B (SAM3/DINOv2)
+
+- SAM3 combined-score threshold (`--sam3-dino-thresh`): `0.2` (on `0.2*sam3_score + 0.8*dino_sim`)
+- Small object threshold (`--small-obj-thresh`): `0.01` (p90 w×h normalised, same as Pipeline A)
+- Containment filter (`--containment-thresh`): `0.85`
+- Duplicate IoU (`--dup-iou-thresh`): `0.85`
+- SAM3 score threshold (`--threshold`): `0.6`
+- Max refs per class for SAM3 exemplars (`--max-refs-per-class`): `5`
+- DINOv2 proto bank size (`--dino-proto-size`): `100`
+- Phash dedup distance (`--phash-max-dist`): `4`
 
 ---
 

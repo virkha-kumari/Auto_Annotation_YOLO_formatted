@@ -7,6 +7,45 @@ Format:
 
 ---
 
+## 2026-07-20
+
+### ADDED — Masked-patch DINOv2 scoring for Pipeline B (`scripts/sam3_dinov2_module.py`)
+
+Pipeline B's DINOv2 scoring was always CLS-on-raw-crop, same noise problem as Pipeline A's finding #8 (0.19–0.43 sims on background clutter) — despite SAM3 already producing a mask per proposal, it was only ever used to derive the box (`mask_to_bbox`), never passed to DINOv2. Fixed:
+
+- `crop_result_to_target` now uses SAM3's own `results["boxes"]` (remapped canvas→target via new `remap_canvas_box_to_target`) instead of deriving the box from the mask, and keeps the mask itself in the det dict.
+- New `mask_ref_crops_sam3()` — box-prompts SAM3 on each ref crop (own source image, own GT box, single-image, no canvas — different mode from the already-failed unprompted auto-mask row in CLAUDE.md's Models table) upfront, right after SAM3 loads, same VRAM phase as target proposals. Reuses the already-loaded SAM3 instead of adding a SAM2 phase.
+- New `embed_masked_crops()` (ported from Pipeline A) — masked-patch pooling for non-small classes, CLS-on-raw-crop fallback for small classes (`--small-obj-thresh`, same 0.01 default and `p90_bbox_area` logic as Pipeline A) and SAM3-miss instances.
+- `select_diverse_refs` split: CLS embeddings there are diversity-selection ranking only now; actual scoring embeddings (masked or CLS) happen later via `build_proto_banks()` + `score_dets_dinov2()`, after ref masking.
+- Sim aggregation switched mean → max (`(prop_embs @ bank.T).max(dim=1)`) — best-matching ref, matching Pipeline A's approach instead of Pipeline B's earlier "mean is more sane" call.
+- `--sam3-dino-thresh` reset to `0.2` and recalibrated under the new masked-patch/max-sim scoring (the 0.3 value from 2026-07-19 was tuned for the old mean-sim/CLS-on-raw-crop scoring, no longer applicable).
+- Mask overlays (image + translucent mask + box, matching `test/debug_sam3.py`'s panel style) saved to `temp_refs/cls<id>/` for refs (`<name>_mask.jpg`, alongside the raw crop, not overwriting it) and `temp_refs/cls<id>/proposals/` for target proposals.
+- `app.py` — added `--small-obj-thresh` UI control (Page 2b), wired into `run_sam3_pipeline`.
+
+**Status:** 10-image smoke test (`data/test/`, all 11 classes covered) confirmed clean end-to-end run post-fix (one real bug caught and fixed: `del crops` in `embed_masked_crops` was deleting the whole input list instead of the batch slice, crashed on the 2nd batch — renamed to `del batch`). All Pipeline B parameters now calibrated to a consistent state. **Full mAP re-run on `data/test/` not yet done** — the 0.171/0.049 numbers from the 2026-07-19 mean-sim/0.3-thresh config are stale and do not reflect this configuration.
+
+---
+
+## 2026-07-19
+
+### ADDED — DINOv2 scoring + combined-score gate, Pipeline B (`scripts/sam3_dinov2_module.py`)
+
+New final-ish stage after SAM3 proposals: `score_dets_dinov2()` embeds each class's ref crops into a proto bank (`select_diverse_refs()` also builds this now — see below), scores each proposal as mean cosine sim (`dino_sim`), then `combined_score = 0.2*sam3_score + 0.8*dino_sim`. Order changed mid-session: gate now runs **before** containment/dup filter (`--sam3-dino-thresh`, default 0.2, drops below thresh) — an oversized/garbage SAM3 box was scoring highest and swallowing every real box of the same class via containment (`containment=inter/min_area` hits 1.0 for any small box inside a big one); scoring on appearance first kills that box before it can suppress anything. Confirmed fixed on `image63.jpg`'s gloves class via manual debug run.
+
+Preview upgraded 2-panel → 3-panel: raw → after combined-score gate → after containment/dup (final). `summary.json` boxes now carry `dino_sim` + `combined_score`. `eval_map.py`'s `load_summary_scores()` updated to rank Pipeline B boxes by `combined_score` (previously didn't understand Pipeline B's flat summary shape at all — was silently uniform-1.0-scoring every eval).
+
+Ref selection split in two: `--max-refs-per-class` (SAM3 exemplars, small, expensive) vs new `--dino-proto-size` (DINOv2 proto bank, default 100, cheap) — SAM3's subset is the first N of the same farthest-point-ordered list. Fixes 5-ref proto banks being too thin for a reliable sim score. Proto-bank-only crops embedded and discarded, never held in RAM; all saved to `temp_refs/cls<id>/` for inspection.
+
+**Follow-up:** 10-image smoke test on `data/test/` confirmed pipeline runs clean end-to-end post-reorder. `--sam3-dino-thresh` re-ablated 0.2→0.3 (better precision, still keeps real boxes) — new default everywhere (script, `app.py`, `CLAUDE.md`). Panel 3 (final) now also labels boxes with `combined_score` instead of raw `sam3_score`, matching panel 2's score language.
+
+Also added: optional `--classes-file` (class names in previews/legends instead of `clsN`), degenerate zero-area box guard in `score_dets_dinov2` (was a `ZeroDivisionError`), `app.py` `crops_dir_state` duplicate-declaration bug fix (two disconnected `gr.State` objects), SAM3 forward-pass try/except (skip bad batch instead of crashing run).
+
+### FINDING — doc/code audit: stale `utils/` refs, wrong defaults, wrong UI tooltips
+
+Fixed: `--small-obj-thresh` doc default (0.02→0.01, deliberate Pipeline A tune not a typo), `utils/*` → `test/*` stale path refs in README/CLAUDE.md, 3 wrong app.py Page 2b tooltips (output-dir paths, SAM3 API name, dup-IoU behavior).
+
+---
+
 ## 2026-07-15
 
 ### ADDED — `data/test/`: 150-image stratified eval split shared by both pipelines

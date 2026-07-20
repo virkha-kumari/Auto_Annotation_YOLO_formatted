@@ -298,9 +298,9 @@ def run_pipeline(
 # Page 2b — SAM3 pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def update_sam3_classes(refs_labels_dir: str):
-    """SAM3 path has no classes.txt dropdown wired to names — discover ids directly
-    from label files and show them as plain ids (no class-name mapping needed here)."""
+def update_sam3_classes(refs_labels_dir: str, classes_txt: str):
+    """Discover class ids from label files. If classes.txt given, show 'id: name'
+    choices (same format as Pipeline A) instead of plain ids — much easier to pick from."""
     labels_path = Path(refs_labels_dir)
     if not labels_path.is_dir():
         return gr.update(choices=[], value=[], interactive=False)
@@ -313,17 +313,21 @@ def update_sam3_classes(refs_labels_dir: str):
                     ids.add(int(parts[0]))
                 except ValueError:
                     pass
-    choices = [str(i) for i in sorted(ids)]
+    classes = load_classes(classes_txt)
+    if classes:
+        choices = [f"{i}: {classes[i]}" if i < len(classes) else str(i) for i in sorted(ids)]
+    else:
+        choices = [str(i) for i in sorted(ids)]
     return gr.update(choices=choices, value=[], interactive=bool(choices))
 
 
 def run_sam3_pipeline(
-    refs_dir, refs_labels_dir, selected_classes, targets_dir, output_dir,
+    refs_dir, refs_labels_dir, classes_txt, selected_classes, targets_dir, output_dir,
     orientation, split_ratio, canvas_size,
     threshold, batch_size,
-    max_refs_per_class, dinov2_batch_size, phash_max_dist,
-    dup_iou, containment_thresh,
-    fp32, ref_jpeg_quality,
+    max_refs_per_class, dino_proto_size, dinov2_batch_size, phash_max_dist,
+    dup_iou, containment_thresh, sam3_dino_thresh,
+    fp32, ref_jpeg_quality, small_obj_thresh,
 ):
     if not refs_dir or not Path(refs_dir).is_dir():
         yield "❌ Refs dir not found.", gr.update(interactive=False), []
@@ -336,7 +340,7 @@ def run_sam3_pipeline(
         return
 
     script = str(Path(__file__).parent / "scripts" / "sam3_dinov2_module.py")
-    class_ids = selected_classes if selected_classes else ["all"]
+    class_ids = [str(i) for i in parse_selected_ids(selected_classes)] if selected_classes else ["all"]
 
     cmd = [
         sys.executable, script,
@@ -351,14 +355,19 @@ def run_sam3_pipeline(
         "--threshold", str(threshold),
         "--batch-size", str(int(batch_size)),
         "--max-refs-per-class", str(int(max_refs_per_class)),
+        "--dino-proto-size", str(int(dino_proto_size)),
         "--dinov2-batch-size", str(int(dinov2_batch_size)),
         "--phash-max-dist", str(int(phash_max_dist)),
         "--dup-iou-thresh", str(dup_iou),
         "--containment-thresh", str(containment_thresh),
+        "--sam3-dino-thresh", str(sam3_dino_thresh),
         "--ref-jpeg-quality", str(int(ref_jpeg_quality)),
+        "--small-obj-thresh", str(small_obj_thresh),
     ]
     if fp32:
         cmd.append("--fp32")
+    if classes_txt and Path(classes_txt).is_file():
+        cmd += ["--classes-file", classes_txt]
 
     full_log = f"[cmd] {' '.join(cmd)}\n"
     yield full_log, gr.update(interactive=False), []
@@ -685,6 +694,15 @@ def build_app():
             gr.Markdown("## SAM3 → DINOv2 Pipeline")
 
             with gr.Row():
+                classes_txt_p2b = gr.Textbox(
+                    label="classes.txt path (optional)",
+                    placeholder="D:/project/classes.txt",
+                    info="YOLO names file, one class per line. If given, class names are shown "
+                         "instead of ids in 'Discover classes' and in the preview panels/legends.",
+                )
+                classes_browse_btn_p2b = gr.Button("📂 Browse", scale=0)
+
+            with gr.Row():
                 refs_dir_p2b = gr.Textbox(
                     label="Reference images folder",
                     placeholder="D:/project/labelled_ref_images",
@@ -720,7 +738,7 @@ def build_app():
                 output_dir_p2b = gr.Textbox(
                     label="Output folder",
                     value="output_sam3_dinov2",
-                    info="Results saved here: previews/, labels/, temp_refs/, ref_crops_temp_embed/",
+                    info="Results saved here: labels/<stem>.txt, <stem>.png (root), temp_refs/cls<id>/",
                 )
                 output_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
 
@@ -740,7 +758,7 @@ def build_app():
             with gr.Row():
                 threshold_p2b = gr.Number(value=0.6, precision=3,
                     label="SAM3 score threshold",
-                    info="post_process_object_detection score gate.")
+                    info="post_process_instance_segmentation score gate.")
                 batch_size_p2b = gr.Slider(1, 16, value=8, step=1,
                     label="Target batch size",
                     info="Targets per SAM3 forward pass (same ref group). Lower if OOM on 8GB VRAM.")
@@ -751,23 +769,35 @@ def build_app():
             gr.Markdown("### Diverse ref selection (DINOv2)")
             with gr.Row():
                 max_refs_p2b = gr.Number(value=5, precision=0,
-                    label="Max refs per class",
-                    info="Diverse refs kept via DINOv2 + farthest-point sampling. 0 = use all refs.")
+                    label="Max refs per class (SAM3 exemplars)",
+                    info="SAM3 exemplar ref_groups — subset of the DINOv2 proto-bank pool below. Small since SAM3 is expensive. 0 = use all.")
+                dino_proto_size_p2b = gr.Number(value=100, precision=0,
+                    label="DINOv2 proto bank size",
+                    info="Ref crops per class in the DINOv2 proto bank, farthest-point sampled. Bigger than max-refs — DINOv2 embedding is cheap. 0 = use all.")
                 dinov2_batch_size_p2b = gr.Slider(4, 64, value=32, step=4,
                     label="DINOv2 batch size",
                     info="Used for both ref embedding and target box scoring.")
-                phash_max_dist_p2b = gr.Slider(0, 20, value=0, step=1,
+                phash_max_dist_p2b = gr.Slider(0, 20, value=4, step=1,
                     label="Phash max dist",
-                    info="Near-duplicate ref crop dedup before DINOv2 embedding. 0 = disabled.")
+                    info="Near-duplicate ref crop dedup before DINOv2 embedding. Calibrated default 4 — cheap, always removes dupes first. 0 = disabled.")
                 ref_jpeg_quality_p2b = gr.Slider(50, 100, value=80, step=5,
                     label="Ref crop JPEG quality",
                     info="Quality for saved crops in output_dir/temp_refs/.")
+                small_obj_thresh_p2b = gr.Number(value=0.01, precision=4,
+                    label="Small-object threshold",
+                    info="p90 ref bbox area below this -> class skips SAM3 masking, DINOv2 uses CLS-on-raw-crop. Same default as Pipeline A.")
 
-            gr.Markdown("### Duplicate + containment filter")
+            gr.Markdown("### SAM3+DINOv2 gate (runs right after SAM3, before containment/dup filter)")
+            with gr.Row():
+                sam3_dino_thresh_p2b = gr.Number(value=0.2, precision=3,
+                    label="SAM3+DINOv2 combined threshold",
+                    info="Gate on combined_score = 0.2*sam3_score + 0.8*dino_sim, before containment/dup filter. Panel 2 (solid=kept, dashed=rejected).")
+
+            gr.Markdown("### Duplicate + containment filter (final stage, runs on DINOv2 survivors)")
             with gr.Row():
                 dup_iou_p2b = gr.Number(value=0.85, precision=3,
                     label="Duplicate IoU",
-                    info="Above this, two SAM3 proposals (same class+target) are merged: highest-score box's coords kept, scores averaged.")
+                    info="Above this IoU, the lower-score of two SAM3 proposals (same class+target) is dropped — no merge/averaging.")
                 containment_thresh_p2b = gr.Number(value=0.85, precision=3,
                     label="Containment threshold",
                     info="Fully-inside-another-box ratio above which the lower-score box is dropped.")
@@ -884,7 +914,6 @@ def build_app():
         # Browse + skip wiring
         skip_crops_browse_btn.click(browse_folder, outputs=skip_crops_dir)
 
-        crops_dir_state = gr.State("")
         active_output_dir = gr.State("")  # which output dir Page3 reads from (YOLOe or SAM3 run)
 
         def do_skip(skip_dir, classes_txt, images_dir, labels_dir):
@@ -914,17 +943,18 @@ def build_app():
         )
 
         # Pipeline (SAM3)
-        load_classes_btn_p2b.click(update_sam3_classes, refs_labels_dir_p2b, class_dropdown_p2b)
+        classes_browse_btn_p2b.click(browse_file, outputs=classes_txt_p2b)
+        load_classes_btn_p2b.click(update_sam3_classes, [refs_labels_dir_p2b, classes_txt_p2b], class_dropdown_p2b)
 
         run_sam3_btn.click(
             run_sam3_pipeline,
             inputs=[
-                refs_dir_p2b, refs_labels_dir_p2b, class_dropdown_p2b, targets_dir_p2b, output_dir_p2b,
+                refs_dir_p2b, refs_labels_dir_p2b, classes_txt_p2b, class_dropdown_p2b, targets_dir_p2b, output_dir_p2b,
                 orientation_p2b, split_ratio_p2b, canvas_size_p2b,
                 threshold_p2b, batch_size_p2b,
-                max_refs_p2b, dinov2_batch_size_p2b, phash_max_dist_p2b,
-                dup_iou_p2b, containment_thresh_p2b,
-                fp32_p2b, ref_jpeg_quality_p2b,
+                max_refs_p2b, dino_proto_size_p2b, dinov2_batch_size_p2b, phash_max_dist_p2b,
+                dup_iou_p2b, containment_thresh_p2b, sam3_dino_thresh_p2b,
+                fp32_p2b, ref_jpeg_quality_p2b, small_obj_thresh_p2b,
             ],
             outputs=[sam3_log, next_to_p3_from_2b, result_images_state],
         )

@@ -61,6 +61,8 @@ mAP averaged over 7 classes with GT present. Classes with 0 GT excluded per COCO
 
 Dataset: same Construction-PPE source images. Eval on a **different, larger test set** than Pipeline A above — 150-image stratified sample (`data/test/`, moved out of `data/label/`) covering all 11 classes, including the `no_*` negative-state classes that had 0 GT in Pipeline A's 50-image eval split. **Numbers below are not directly comparable to Pipeline A's table above** — different image count, different class coverage. A same-set comparison needs Pipeline A re-run on `data/test/` too.
 
+**⚠️ Note (2026-07-20):** table below predates DINOv2 masked-patch scoring, max-sim, and the current `--sam3-dino-thresh 0.2` default (all added/recalibrated 2026-07-20) — numbers are stale, from an earlier mean-sim/CLS-on-raw-crop/0.3-thresh configuration. Smoke-tested only since; full mAP re-run pending (see `docs/plans.md`).
+
 **Command:** `python scripts/eval_map.py --preds output_sam3_dinov2_ppe/labels --gt data/test --images data/test --classes helmet gloves vest boots goggles none Person no_helmet no_goggle no_gloves no_boots`
 
 | Class | Prec | Rec | F1 | AP@.50 | AP@.5:.95 | nPred | nGT |
@@ -84,15 +86,14 @@ mAP averaged over all 11 classes (all have GT present in this 150-image set).
 - **Person (cls6):** 0.725 F1, AP=0.570 — best class, consistent with Pipeline A.
 - **Helmet (cls0):** 0.604 F1 — high recall (0.807) but precision only 0.483, more FPs than Pipeline A's helmet result.
 
-**What's hard:**
-- **`no_boots` (cls10):** prec=0.004 — 540 preds for 53 GT, near-total FP flood. SAM3 canvas-composite proposals have no similarity gate yet (see Pipeline B status below) — this is the clearest symptom of that missing filter.
+**What's hard (as of the stale table above):**
+- **`no_boots` (cls10):** prec=0.004 — 540 preds for 53 GT, near-total FP flood.
 - **`no_goggle` (cls9):** 0 TP at all — 224 preds, all FP.
-- **Negative-state classes generally weak** (`no_helmet`, `no_goggle`, `no_gloves`, `no_boots`): these classes are defined by *absence* of a visual feature, which is a poor match for SAM3's exemplar-based few-shot matching — same fundamental issue as `none` in Pipeline A.
-- **No DINOv2 cosine-sim gate on SAM3 proposals yet** — current filtering is containment + duplicate suppression only. The FP-flood classes above are the direct evidence this gate is needed next.
+- **Negative-state classes generally weak** (`no_helmet`, `no_goggle`, `no_gloves`, `no_boots`): these classes are defined by *absence* of a visual feature, which is a poor match for SAM3's exemplar-based few-shot matching — same fundamental issue as `none` in Pipeline A. Whether the current DINOv2 masked-patch + max-sim scoring (added 2026-07-20) helps here is untested — pending mAP re-run.
 
 ### Sample outputs
 
-*2-panel preview: left = all raw SAM3 proposals color-coded by class, right = kept (solid) vs rejected (dashed) after containment+dup filter.*
+*⚠️ Stale — samples below are from 2026-07-15, before the DINOv2 gate existed (added 2026-07-19) — 2-panel format: left = all raw SAM3 proposals color-coded by class, right = kept (solid) vs rejected (dashed) after containment+dup filter. Current pipeline produces a 3rd panel: kept (solid) vs rejected (dashed) after the DINOv2 sim gate, labeled with sim score. New samples pending re-run.*
 
 | image639 (47 final boxes) | image1206 (41 final boxes) |
 |---|---|
@@ -243,7 +244,7 @@ YOLOe→SAM2→DINOv2→WBF was confirmed correct and running end-to-end, but th
 
 **Confirmed working end-to-end (2026-07-10)** on a real multi-class dataset — 5 classes, bf16, DINOv2 diverse-ref selection.
 
-**Integrated as a second production pipeline (2026-07-14).** `test/debug_sam3.py` (per-pair 4-panel debug figures) rewritten into `scripts/sam3_dinov2_module.py`: per-target aggregation across all classes/ref-groups, containment + duplicate filter, one YOLO `.txt` + one 2-panel preview per target, `summary.json`. Wired into `app.py` as a second wizard path (landing page picks YOLOe→SAM2→DINOv2 or SAM3→DINOv2 — SAM3 skips crop extraction entirely, works straight off labelled reference images). Still missing the one thing the YOLOe path already has: a similarity sanity check on its own proposals — SAM3's canvas-composite output has no DINOv2 cosine-sim gate yet, only containment/duplicate suppression. **Next:** add that scoring layer (proposal crop vs ref crop, cosine sim, threshold), then a real accuracy pass, before deciding whether this replaces or complements YOLOe→SAM2→DINOv2.
+**Integrated as a second production pipeline (2026-07-14).** `test/debug_sam3.py` (per-pair 4-panel debug figures) rewritten into `scripts/sam3_dinov2_module.py`: SAM3 proposals → combined-score gate → containment + duplicate filter → YOLO `.txt` + 3-panel preview + `summary.json` per target. Wired into `app.py` as a second wizard path. **Added 2026-07-19:** combined-score gate (`0.2*sam3_score + 0.8*dino_sim`, `--sam3-dino-thresh` default 0.2) runs before containment/dup filter — fixes an oversized garbage SAM3 box swallowing real boxes via containment. **Next:** re-run accuracy pass on `data/test/` (see `docs/plans.md`).
 
 ---
 
@@ -306,7 +307,9 @@ python scripts/sam3_dinov2_module.py \
 | `test/debug_yoloe_sam2_dino.py` | Pipeline A debug, 4-panel matplotlib viz | Active |
 | `test/debug_sam3.py` | Pipeline B debug, 4-panel matplotlib viz per (ref, target) pair | Active |
 | `test/test_yoloe_batch.py` | Benchmark: batched vs per-target YOLOe (confirmed 2.91×) | Reference |
-| `utils/debug_yoloe.py` | Pure YOLOe visual-prompt debug (no DINOv2) | Reference |
+| `test/debug_yoloe.py` | Pure YOLOe visual-prompt debug (no DINOv2) | Reference |
+| `test/debug_yoloe_dinov2.py` | YOLOe + DINOv2, 3-panel viz, no SAM2 (predates `debug_yoloe_sam2_dino.py`) | Reference |
+| `test/test_owlv2_dinov2.py` | OWLv2 + DINOv2 pipeline | Dead end |
 
 ---
 
@@ -361,10 +364,11 @@ output_dir/
 ├── labels/
 │   ├── image1.txt          # YOLO format, all classes in one file per target
 │   └── image2.txt
-├── image1.png               # 2-panel matplotlib preview: raw SAM3 proposals | kept(solid)/rejected(dashed)
+├── image1.png               # 3-panel matplotlib preview: raw proposals | containment+dup kept/rejected | DINOv2-gate kept/rejected
 ├── image2.png
 ├── temp_refs/cls<id>/       # diverse-ref crops chosen by DINOv2+farthest-point sampling
-└── summary.json             # {target_name: {label_file, preview_file, n_final_total}}
+└── summary.json             # {target_name: {label_file, preview_file, n_final_total,
+                            #   boxes: [{class_id, box, sam3_score, dino_sim, combined_score}]}}
 ```
 
 ---
@@ -451,9 +455,9 @@ Everything built and tested in this repo, in order:
 
 Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile bbox area across all source labels per class at startup. If p90 < `--small-obj-thresh`, class skips SAM2 entirely and uses mean of all DINOv2 tokens on raw bbox crop. Both refs and proposals use identical method per class (invariant enforced).
 
-**`scripts/eval_map.py`** — evaluation script (new, this session). Pure numpy, no torchvision/pycocotools. Loads predicted YOLO `.txt` + GT YOLO `.txt`, reads scores from `summary.json` if present (else uniform 1.0), computes per-class P/R/F1 at configurable IoU, AP@.50 (101-point interpolation), mAP@.50:.95 (10-threshold COCO average). Global confidence-sorted matching with per-image matched-GT sets (correct — avoids cross-image TP assignment bug). Prints per-image tp/fp/fn breakdown. Classes with 0 GT excluded from mAP mean with explicit print notice.
+**`scripts/eval_map.py`** — evaluation script. Pure numpy, no torchvision/pycocotools. Loads predicted YOLO `.txt` + GT YOLO `.txt`, reads scores from `summary.json` if present (else uniform 1.0). `load_summary_scores()` handles both shapes: Pipeline A's nested `classes: {cls_id: {boxes: [{score}]}}`, Pipeline B's flat `boxes: [{class_id, combined_score}]`. Computes per-class P/R/F1 at configurable IoU, AP@.50 (101-point interpolation), mAP@.50:.95 (10-threshold COCO average). Global confidence-sorted matching with per-image matched-GT sets. Classes with 0 GT excluded from mAP mean.
 
-**`scripts/sam3_dinov2_module.py`** — Pipeline B, SAM3 canvas-composite few-shot production pipeline. No crop-extraction step — works directly off labelled reference images + YOLO labels. DINOv2 diverse-ref selection (farthest-point sampling) → SAM3 canvas-composite exemplar prompting, batched per ref-group → per-target aggregation across all classes/ref-groups → per-class-id containment + duplicate filter → YOLO `.txt` + 2-panel preview + `summary.json` per target.
+**`scripts/sam3_dinov2_module.py`** — Pipeline B, SAM3 canvas-composite few-shot production pipeline. No crop-extraction step — works directly off labelled reference images + YOLO labels. DINOv2 diverse-ref selection (`--max-refs-per-class` for SAM3 exemplars, bigger `--dino-proto-size` for the proto bank) → SAM3 canvas-composite exemplar prompting on targets (keeps SAM3's own mask + box per proposal) → SAM3 box-prompted on ref crops too (single-image, own GT box, same loaded model) → DINOv2 masked-patch pooling + max-sim vs proto bank (small classes: CLS-on-raw-crop, same `--small-obj-thresh` rule as Pipeline A) → combined-score gate (`0.2*sam3_score + 0.8*dino_sim`, `--sam3-dino-thresh`) → per-class-id containment + duplicate filter → YOLO `.txt` + 3-panel preview + `summary.json` per target. Optional `--classes-file` shows class names instead of ids in previews.
 
 **`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A (YOLOe→SAM2→DINOv2, needs crop extraction first) or Pipeline B (SAM3→DINOv2, no crop extraction). Page 1: crop extraction (calls `extract_crops_labelled.py`, Pipeline A only). Page 2 / Page 2b: pipeline run (calls `yoloe_sam2_dinov2_module.py` or `sam3_dinov2_module.py`, streams log output). Page 3: shared result gallery + YOLO label download, reads whichever `summary.json` the active run produced. All pipeline parameters exposed as UI controls.
 
@@ -463,15 +467,17 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 
 **`test/test_yoloe_batch.py`** — benchmark confirming batched YOLOe (VPE bake once per stem, predict all targets) gives 2.91× speedup vs per-target loop. Proposal counts identical (242 vs 242) confirming correctness.
 
-**`test/debug_yoloe.py`**, **`utils/debug_yoloe.py`** — pure YOLOe visual-prompt debug, no DINOv2. Used to diagnose proposal quality in isolation.
+**`test/debug_yoloe.py`** — pure YOLOe visual-prompt debug, no DINOv2. Used to diagnose proposal quality in isolation.
 
-**`utils/test_owlv2_dinov2.py`** — OWLv2 + DINOv2 pipeline. Dead end: OWLv2 failed on large objects due to patch-based ViT architecture. Kept as reference.
+**`test/debug_yoloe_dinov2.py`** — earlier YOLOe+DINOv2 debug script (3-panel viz: ref bboxes, YOLOe conf, DINOv2 sim), no SAM2 masking. Superseded by `test/debug_yoloe_sam2_dino.py` (adds SAM2 masked-crop stage, 4-panel viz) but kept as reference for the pre-SAM2 scoring approach.
+
+**`test/test_owlv2_dinov2.py`** — OWLv2 + DINOv2 pipeline. Dead end: OWLv2 failed on large objects due to patch-based ViT architecture. Kept as reference.
 
 ### Docs
 
 **`docs/log.md`** — chronological ADDED/DROPPED/FINDING log. Every design decision and dead end recorded with reason.
 
-**`docs/notes.md`** — pipeline design decisions and dataset overview.
+**`docs/plans.md`** — what to do next, tracked forward-looking only.
 
 ### Findings confirmed in this repo
 
@@ -486,11 +492,21 @@ Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile 
 9. SAM2/SAM3 failed as proposal generators on industrial/PPE scenes (no texture-contrast boundary signal).
 10. `none` (background/negative) class cannot be proposed by YOLOe — no coherent visual prototype exists.
 11. mAP@.50 = 0.254 on Construction-PPE 10-class eval. Person best (AP=0.559), gloves worst (AP=0.053). Goggles FP-flooded (prec=0.023).
+12. Pipeline B had the same full-crop-CLS noise problem as finding #4 above (SAM3 gave masks but the pipeline only used them to derive the box, not for DINOv2 scoring). Fixed by reusing SAM3's mask for proposals and box-prompting SAM3 on ref crops too — masked-patch pooling + max-sim now used by both pipelines, calibrated 2026-07-20, mAP re-run pending.
 ---
 
 ## Inspirations
 
 - [WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) — canvas-composite technique for cross-image few-shot exemplar prompting with a frozen SAM3 (paste reference + target into one shared canvas, remap the reference bbox into canvas coordinates, prompt SAM3 once, crop the target region back out). SAM3 has no native cross-image exemplar API — image-exemplar boxes only match within the same image they're drawn on — so this composite-canvas trick is what `test/debug_sam3.py` uses to test SAM3's raw few-shot capability against labelled reference instances. Full incremental history in the ablation's "Stage 6" above and `docs/log.md`.
+
+
+## Links
+
+- DINOv2: https://github.com/facebookresearch/dinov2
+- SAM2: https://github.com/facebookresearch/segment-anything-2
+- YOLOe: https://docs.ultralytics.com/models/yoloe/
+- SAM3 few-shot canvas trick: https://github.com/WongKinYiu/FSS-SAM3
+- Construction-PPE dataset: https://docs.ultralytics.com/datasets/detect/construction-ppe
 
 ## Collaboration
 
