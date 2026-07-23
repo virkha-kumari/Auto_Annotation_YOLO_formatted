@@ -581,7 +581,7 @@ def build_app():
                     auto_tune_percentile_p1 = gr.Number(value=85, precision=0,
                         label="KNN percentile",
                         info="kNN distance percentile for eps.")
-                    batch_size_p1 = gr.Slider(8, 64, value=32, step=8,
+                    batch_size_p1 = gr.Number(value=32, precision=0,
                         label="DINOv2 batch size",
                         info="Reduce if VRAM OOM.")
 
@@ -662,7 +662,7 @@ def build_app():
                 nms_iou = gr.Number(value=0.45, precision=3,
                     label="NMS IoU",
                     info="Higher = fewer merges.")
-                yoloe_batch_size = gr.Slider(1, 32, value=8, step=1,
+                yoloe_batch_size = gr.Number(value=8, precision=0,
                     label="YOLOe target batch size",
                     info="Higher = faster, more VRAM.")
 
@@ -671,7 +671,7 @@ def build_app():
                 dino_thresh = gr.Number(value=0.65, precision=3,
                     label="DINOv2 similarity threshold",
                     info="Min cosine sim to keep proposal.")
-                dino_batch_size = gr.Slider(4, 64, value=32, step=4,
+                dino_batch_size = gr.Number(value=32, precision=0,
                     label="DINOv2 batch size",
                     info="Reduce if VRAM OOM.")
                 small_obj_thresh = gr.Number(value=0.02, precision=4,
@@ -787,7 +787,7 @@ def build_app():
                 threshold_p2b = gr.Number(value=0.6, precision=3,
                     label="SAM3 score threshold",
                     info="Score gate.")
-                batch_size_p2b = gr.Slider(1, 16, value=8, step=1,
+                batch_size_p2b = gr.Number(value=8, precision=0,
                     label="Target batch size",
                     info="Lower if OOM.")
                 fp32_p2b = gr.Checkbox(value=False,
@@ -802,7 +802,7 @@ def build_app():
                 dino_proto_size_p2b = gr.Number(value=100, precision=0,
                     label="DINOv2 proto bank size",
                     info="Ref crops/class, FPS-sampled. 0=all.")
-                dinov2_batch_size_p2b = gr.Slider(4, 64, value=32, step=4,
+                dinov2_batch_size_p2b = gr.Number(value=32, precision=0,
                     label="DINOv2 batch size",
                     info="Ref embed + target scoring.")
                 phash_max_dist_p2b = gr.Slider(0, 20, value=4, step=1,
