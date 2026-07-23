@@ -328,6 +328,7 @@ python scripts/sam3_dinov2_module.py \
 | `--dino-thresh` | 0.65 | Min cosine sim to keep a proposal. Tune per dataset. |
 | `--dino-batch-size` | 32 | Embedding batch size. Reduce if VRAM OOM. |
 | `--small-obj-thresh` | 0.01 | 90th-percentile bbox area (w×h normalised) below which class uses bbox-crop + mean-pool embedding instead of SAM2 masked-patch pooling. |
+| `--no-mask-classes` | none | Force these class ids into small-object handling regardless of `--small-obj-thresh`. |
 
 ### SAM2
 | Arg | Default | Notes |
@@ -342,6 +343,22 @@ python scripts/sam3_dinov2_module.py \
 | `--wbf-score` | 0.10 | Min combined score after WBF. Low = keep all for review. |
 | `--result-thresh` | 0.50 | Gate for final saved boxes. |
 | `--containment-thresh` | 0.70 | Nested box removal threshold (intersection/min_area). |
+| `--no-preview` | off | Skip preview jpg save — labels + summary.json only. |
+
+### Pipeline B (SAM3/DINOv2)
+| Arg | Default | Notes |
+|---|---|---|
+| `--threshold` | 0.6 | SAM3 score gate. |
+| `--sam3-dino-thresh` | 0.2 | Combined gate: `0.2*sam3_score + 0.8*dino_sim`. |
+| `--small-obj-thresh` | 0.01 | Same rule as Pipeline A. |
+| `--no-mask-classes` | none | Force class ids into small-object handling regardless of `--small-obj-thresh`. |
+| `--ref-box-padding` | 0.01 | Fractional ref bbox padding (clamped to image). Fixes fingertip/thin-extremity clipping. |
+| `--containment-thresh` | 0.85 | Nested box removal threshold. |
+| `--dup-iou-thresh` | 0.85 | Duplicate box IoU threshold. |
+| `--max-refs-per-class` | 5 | SAM3 exemplar ref groups per class. |
+| `--dino-proto-size` | 100 | Proto bank size per class (farthest-point sampled). |
+| `--phash-max-dist` | 4 | Ref crop dedup distance. 0=off. |
+| `--no-preview` | off | Skip 3-panel figure — labels + summary.json only (proposal mask overlays still saved). |
 
 ---
 
@@ -354,7 +371,7 @@ output_dir/
 ├── image1_preview.jpg      # PIL preview — cls0=orange, cls1=cyan, cls2=green, cls3=red
 ├── image2.txt
 ├── image2_preview.jpg
-└── summary.json            # {target_name: {label_file, preview_file, n_final_total,
+└── summary.json            # {target_name: {label_file, preview_file (null if --no-preview), n_final_total,
                             #   classes: {cls_id: {n_proposals, n_wbf, n_final, boxes}}}}
 ```
 
@@ -367,7 +384,7 @@ output_dir/
 ├── image1.png               # 3-panel matplotlib preview: raw proposals | containment+dup kept/rejected | DINOv2-gate kept/rejected
 ├── image2.png
 ├── temp_refs/cls<id>/       # diverse-ref crops chosen by DINOv2+farthest-point sampling
-└── summary.json             # {target_name: {label_file, preview_file, n_final_total,
+└── summary.json             # {target_name: {label_file, preview_file (null if --no-preview), n_final_total,
                             #   boxes: [{class_id, box, sam3_score, dino_sim, combined_score}]}}
 ```
 
@@ -453,13 +470,13 @@ Everything built and tested in this repo, in order:
 - Phase 3: DINOv2 loads once, builds proto bank per class (individual crop embeddings, not averaged), scores all proposals via cosine sim `prop @ bank.T → max`, drops below `--dino-thresh`.
 - Phase 4: WBF (`0.3×yoloe_conf + 0.7×dino_sim`), containment filter, saves YOLO `.txt` + preview `.jpg` per target + `summary.json`.
 
-Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile bbox area across all source labels per class at startup. If p90 < `--small-obj-thresh`, class skips SAM2 entirely and uses mean of all DINOv2 tokens on raw bbox crop. Both refs and proposals use identical method per class (invariant enforced).
+Small-object detection auto-routing: `p90_bbox_area()` computes 90th-percentile bbox area across all source labels per class at startup. If p90 < `--small-obj-thresh`, class skips SAM2 entirely and uses mean of all DINOv2 tokens on raw bbox crop. Both refs and proposals use identical method per class (invariant enforced). `--no-mask-classes` forces this routing for specific class ids regardless of threshold. `--no-preview` skips the preview jpg (labels + summary.json only).
 
 **`scripts/eval_map.py`** — evaluation script. Pure numpy, no torchvision/pycocotools. Loads predicted YOLO `.txt` + GT YOLO `.txt`, reads scores from `summary.json` if present (else uniform 1.0). `load_summary_scores()` handles both shapes: Pipeline A's nested `classes: {cls_id: {boxes: [{score}]}}`, Pipeline B's flat `boxes: [{class_id, combined_score}]`. Computes per-class P/R/F1 at configurable IoU, AP@.50 (101-point interpolation), mAP@.50:.95 (10-threshold COCO average). Global confidence-sorted matching with per-image matched-GT sets. Classes with 0 GT excluded from mAP mean.
 
-**`scripts/sam3_dinov2_module.py`** — Pipeline B, SAM3 canvas-composite few-shot production pipeline. No crop-extraction step — works directly off labelled reference images + YOLO labels. DINOv2 diverse-ref selection (`--max-refs-per-class` for SAM3 exemplars, bigger `--dino-proto-size` for the proto bank) → SAM3 canvas-composite exemplar prompting on targets (keeps SAM3's own mask + box per proposal) → SAM3 box-prompted on ref crops too (single-image, own GT box, same loaded model) → DINOv2 masked-patch pooling + max-sim vs proto bank (small classes: CLS-on-raw-crop, same `--small-obj-thresh` rule as Pipeline A) → combined-score gate (`0.2*sam3_score + 0.8*dino_sim`, `--sam3-dino-thresh`) → per-class-id containment + duplicate filter → YOLO `.txt` + 3-panel preview + `summary.json` per target. Optional `--classes-file` shows class names instead of ids in previews.
+**`scripts/sam3_dinov2_module.py`** — Pipeline B, SAM3 canvas-composite few-shot production pipeline. No crop-extraction step — works directly off labelled reference images + YOLO labels. Ref bboxes get `--ref-box-padding` (default 0.01, clamped to image) before use, fixing fingertip/thin-extremity clipping from tight boxes. DINOv2 diverse-ref selection (`--max-refs-per-class` for SAM3 exemplars, bigger `--dino-proto-size` for the proto bank) → SAM3 canvas-composite exemplar prompting on targets (keeps SAM3's own mask + box per proposal) → SAM3 box-prompted on ref crops too (single-image, own GT box, same loaded model) → DINOv2 masked-patch pooling + max-sim vs proto bank (small classes: CLS-on-raw-crop, same `--small-obj-thresh` rule as Pipeline A, or forced via `--no-mask-classes`) → combined-score gate (`0.2*sam3_score + 0.8*dino_sim`, `--sam3-dino-thresh`) → per-class-id containment + duplicate filter → YOLO `.txt` + 3-panel preview (skippable via `--no-preview`) + `summary.json` per target. Optional `--classes-file` shows class names instead of ids in previews.
 
-**`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A (YOLOe→SAM2→DINOv2, needs crop extraction first) or Pipeline B (SAM3→DINOv2, no crop extraction). Page 1: crop extraction (calls `extract_crops_labelled.py`, Pipeline A only). Page 2 / Page 2b: pipeline run (calls `yoloe_sam2_dinov2_module.py` or `sam3_dinov2_module.py`, streams log output). Page 3: shared result gallery + YOLO label download, reads whichever `summary.json` the active run produced. All pipeline parameters exposed as UI controls.
+**`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A (YOLOe→SAM2→DINOv2, needs crop extraction first) or Pipeline B (SAM3→DINOv2, no crop extraction). Page 1: crop extraction (calls `extract_crops_labelled.py`, Pipeline A only). Page 2 / Page 2b: pipeline run (calls `yoloe_sam2_dinov2_module.py` or `sam3_dinov2_module.py`, streams log output) — both expose "Force no-mask classes" and "Skip preview images" controls; Pipeline B also exposes "Ref box padding". Page 3: shared result gallery + YOLO label download, reads whichever `summary.json` the active run produced. All pipeline parameters exposed as UI controls.
 
 ### Test / debug scripts
 

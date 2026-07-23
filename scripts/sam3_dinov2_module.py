@@ -87,8 +87,8 @@ def discover_class_ids(refs_labels: Path) -> list[int]:
     return sorted(ids)
 
 
-def collect_ref_boxes(refs_dir: Path, refs_labels: Path, class_ids: list[int]) -> dict[int, list[dict]]:
-    """Metadata-only: parse labels for boxes matching class_ids, read image size from header (no pixel decode) to convert YOLO norm coords to px. 
+def collect_ref_boxes(refs_dir: Path, refs_labels: Path, class_ids: list[int], box_padding: float = 0.0) -> dict[int, list[dict]]:
+    """Metadata-only: parse labels for boxes matching class_ids, read image size from header (no pixel decode) to convert YOLO norm coords to px.
     Full decode deferred until an instance survives diverse-ref selection."""
     wanted = set(class_ids)
     boxes_by_class: dict[int, list[dict]] = {c: [] for c in class_ids}
@@ -129,7 +129,13 @@ def collect_ref_boxes(refs_dir: Path, refs_labels: Path, class_ids: list[int]) -
             except ValueError:
                 print(f"[warn] malformed box in {label_path.name} line {i} — skipped")
                 continue
-            box_xywh = [(cx - w / 2) * iw, (cy - h / 2) * ih, w * iw, h * ih]  # x,y,w,h px
+            x, y, bw, bh = (cx - w / 2) * iw, (cy - h / 2) * ih, w * iw, h * ih  # x,y,w,h px
+            if box_padding > 0:
+                px, py = bw * box_padding, bh * box_padding
+                x1, y1 = max(0.0, x - px), max(0.0, y - py)
+                x2, y2 = min(iw, x + bw + px), min(ih, y + bh + py)
+                x, y, bw, bh = x1, y1, x2 - x1, y2 - y1
+            box_xywh = [x, y, bw, bh]
             boxes_by_class[cid].append({
                 "img_path": img_path,
                 "box": box_xywh,
@@ -824,6 +830,15 @@ def parse_args():
     p.add_argument("--small-obj-thresh", type=float, default=0.01,
                     help="p90 ref bbox area below this -> class is small, skips masking, DINOv2 "
                          "uses CLS-on-raw-crop. Same default as Pipeline A.")
+    p.add_argument("--ref-box-padding", type=float, default=0.01,
+                    help="Fractional ref bbox padding, clamped to image bounds.")
+    p.add_argument("--no-mask-classes", nargs="+", type=int, default=[],
+                    help="Class IDs to force into small-object handling (skip SAM3 mask usage, "
+                         "DINOv2 uses CLS-on-raw-crop) regardless of --small-obj-thresh. For classes "
+                         "too hard/unreliable to mask (e.g. thin/reflective/occluded objects).")
+    p.add_argument("--no-preview", action="store_true",
+                    help="Skip saving the 3-panel summary figure per target — labels/summary.json only. "
+                         "Proposal mask-overlay debug jpgs in temp_refs/ are still saved.")
     return p.parse_args()
 
 def main():
@@ -848,7 +863,7 @@ def main():
         print("[abort] No class ids found.")
         return
 
-    raw_ref_boxes_by_class = collect_ref_boxes(Path(args.refs_dir), refs_labels_dir, class_ids)
+    raw_ref_boxes_by_class = collect_ref_boxes(Path(args.refs_dir), refs_labels_dir, class_ids, args.ref_box_padding)
     ref_boxes_by_class = {}
     for class_id in class_ids:
         boxes = raw_ref_boxes_by_class.get(class_id, [])
@@ -872,6 +887,10 @@ def main():
     if small_cls:
         print(f"[small-obj] classes {sorted(small_cls)} below --small-obj-thresh={args.small_obj_thresh} "
               f"— SAM3 masking skipped, DINOv2 uses CLS-on-raw-crop")
+    forced = set(args.no_mask_classes) & set(class_ids)
+    if forced:
+        print(f"[no-mask-classes] forcing small-object handling for cls: {sorted(forced)}")
+        small_cls |= forced
 
     # Diverse ref selection (DINOv2) must run before SAM3 loads — VRAM rule.
     ref_instances_by_class, proto_instances_by_class = select_diverse_refs(
@@ -1049,14 +1068,15 @@ def main():
 
         target_img = target_imgs[target_path]
         out_path = output_dir / f"{target_path.stem}.png"
-        save_futures.append(save_pool.submit(
-            save_target_figure, target_img, raw_dets, dino_kept, dino_rejected,
-            kept_all, rejected_all, target_path.name, out_path, class_names,
-        ))
+        if not args.no_preview:
+            save_futures.append(save_pool.submit(
+                save_target_figure, target_img, raw_dets, dino_kept, dino_rejected,
+                kept_all, rejected_all, target_path.name, out_path, class_names,
+            ))
 
         summary[target_path.name] = {
             "label_file": str(label_path.resolve()),
-            "preview_file": str(out_path.resolve()),
+            "preview_file": None if args.no_preview else str(out_path.resolve()),
             "n_final_total": len(kept_all),
             "boxes": [{"class_id": d["class_id"], "box": d["box"], "sam3_score": d["score"],
                        "dino_sim": d.get("dino_sim"), "combined_score": d.get("combined_score")} for d in kept_all],

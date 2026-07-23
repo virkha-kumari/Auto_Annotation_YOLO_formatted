@@ -1,9 +1,5 @@
 """
-Auto-Annotation Gradio App — 3-page wizard.
-
-Page 1: Dataset setup + crop extraction
-Page 2: Pipeline args + run (YOLOe → SAM2 → DINOv2 → WBF)
-Page 3: Results viewer + YOLO .txt download
+Auto-Annotation Gradio App
 """
 
 import json
@@ -178,7 +174,8 @@ def run_crop_extraction(
 def update_pipeline_classes(classes_txt: str):
     classes = load_classes(classes_txt)
     choices = class_choices(classes)
-    return gr.update(choices=choices, value=[], interactive=bool(choices))
+    upd = gr.update(choices=choices, value=[], interactive=bool(choices))
+    return upd, upd
 
 
 def run_pipeline(
@@ -189,6 +186,7 @@ def run_pipeline(
     dino_thresh, result_panel3_thresh, final_containment_thresh,
     sam2_mask_padding, sam_score_min, sam_area_min,
     dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir,
+    no_mask_classes, no_preview,
 ):
     if not targets_dir or not Path(targets_dir).is_dir():
         yield "❌ Targets dir not found.", gr.update(interactive=False), []
@@ -258,6 +256,11 @@ def run_pipeline(
         "--yoloe-batch-size",   str(int(yoloe_batch_size)),
         "--small-obj-thresh",   str(small_obj_thresh),
     ]
+    no_mask_ids = parse_selected_ids(no_mask_classes) if no_mask_classes else []
+    if no_mask_ids:
+        cmd += ["--no-mask-classes", *[str(c) for c in no_mask_ids]]
+    if no_preview:
+        cmd.append("--no-preview")
 
     full_log += f"[cmd] {' '.join(cmd)}\n"
     yield full_log, gr.update(interactive=False), []
@@ -285,7 +288,10 @@ def run_pipeline(
     if summary_path.exists():
         summary = json.loads(summary_path.read_text())
         for target_name, info in summary.items():
-            preview = Path(info.get("preview_file", ""))
+            preview_file = info.get("preview_file")
+            if not preview_file:
+                continue
+            preview = Path(preview_file)
             if preview.exists():
                 n = info.get("n_final_total", "?")
                 all_result_images.append((str(preview),
@@ -318,7 +324,8 @@ def update_sam3_classes(refs_labels_dir: str, classes_txt: str):
         choices = [f"{i}: {classes[i]}" if i < len(classes) else str(i) for i in sorted(ids)]
     else:
         choices = [str(i) for i in sorted(ids)]
-    return gr.update(choices=choices, value=[], interactive=bool(choices))
+    upd = gr.update(choices=choices, value=[], interactive=bool(choices))
+    return upd, upd
 
 
 def run_sam3_pipeline(
@@ -328,6 +335,7 @@ def run_sam3_pipeline(
     max_refs_per_class, dino_proto_size, dinov2_batch_size, phash_max_dist,
     dup_iou, containment_thresh, sam3_dino_thresh,
     fp32, ref_jpeg_quality, small_obj_thresh,
+    no_mask_classes, no_preview, ref_box_padding,
 ):
     if not refs_dir or not Path(refs_dir).is_dir():
         yield "❌ Refs dir not found.", gr.update(interactive=False), []
@@ -363,11 +371,17 @@ def run_sam3_pipeline(
         "--sam3-dino-thresh", str(sam3_dino_thresh),
         "--ref-jpeg-quality", str(int(ref_jpeg_quality)),
         "--small-obj-thresh", str(small_obj_thresh),
+        "--ref-box-padding", str(ref_box_padding),
     ]
     if fp32:
         cmd.append("--fp32")
     if classes_txt and Path(classes_txt).is_file():
         cmd += ["--classes-file", classes_txt]
+    no_mask_ids = parse_selected_ids(no_mask_classes) if no_mask_classes else []
+    if no_mask_ids:
+        cmd += ["--no-mask-classes", *[str(c) for c in no_mask_ids]]
+    if no_preview:
+        cmd.append("--no-preview")
 
     full_log = f"[cmd] {' '.join(cmd)}\n"
     yield full_log, gr.update(interactive=False), []
@@ -395,7 +409,10 @@ def run_sam3_pipeline(
     if summary_path.exists():
         summary = json.loads(summary_path.read_text())
         for target_name, info in summary.items():
-            preview = Path(info.get("preview_file", ""))
+            preview_file = info.get("preview_file")
+            if not preview_file:
+                continue
+            preview = Path(preview_file)
             if preview.exists():
                 n = info.get("n_final_total", "?")
                 all_result_images.append((str(preview), f"{Path(target_name).stem} | {n} box(es)"))
@@ -417,7 +434,10 @@ def collect_results(output_dir, classes_txt_p2, selected_classes_p2):
         return gallery
     summary = json.loads(summary_path.read_text())
     for target_name, info in summary.items():
-        preview = Path(info.get("preview_file", ""))
+        preview_file = info.get("preview_file")
+        if not preview_file:
+            continue
+        preview = Path(preview_file)
         if not preview.exists():
             continue
         n = info.get("n_final_total", "?")
@@ -518,7 +538,7 @@ def build_app():
                 labels_dir_p1 = gr.Textbox(
                     label="Labels folder",
                     placeholder="Auto-filled from images folder",
-                    info="Folder with YOLO .txt label files. Auto-filled from images folder — change if different.",
+                    info="YOLO .txt labels.",
                 )
                 labels_browse_btn_p1 = gr.Button("📂", scale=0, min_width=40)
 
@@ -528,42 +548,42 @@ def build_app():
                 choices=["Unique crops (clustered)", "All crops (no clustering)"],
                 value="Unique crops (clustered)",
                 label="Crop extraction mode",
-                info="Unique: DINOv2+DBSCAN to pick diverse reps (recommended for 50-100 seed crops). All: save every crop as-is (use if you manually annotated specific frames).",
+                info="Unique: clustered reps. All: every crop.",
             )
 
             with gr.Row():
                 stride_p1 = gr.Slider(1, 10, value=2, step=1,
                     label="Stride",
-                    info="Process every Nth image. Stride=2 halves scan time.")
+                    info="Every Nth image.")
                 padding_p1 = gr.Number(value=0.0, precision=3,
                     label="BBox padding",
-                    info="Fractional padding around each crop bbox. 0.05 = 5% context around the object.")
+                    info="Fractional context around bbox.")
                 min_hash_dist_p1 = gr.Slider(0, 20, value=6, step=1,
                     label="Min phash distance",
-                    info="Perceptual hash dedup threshold. Higher = more aggressive dedup. 0 = off.")
+                    info="Higher = more dedup. 0=off.")
 
             with gr.Group(visible=True) as unique_crop_opts:
                 gr.Markdown("**Clustering options** *(Unique crops mode only)*")
                 with gr.Row():
                     dbscan_eps_p1 = gr.Number(value=0.15, precision=3,
                         label="DBSCAN eps",
-                        info="Cosine distance threshold for clustering. Lower = tighter clusters (more reps). Ignored if auto-tune is on.")
+                        info="Lower = tighter clusters. Ignored if auto-tune on.")
                     dbscan_min_samples_p1 = gr.Number(value=2, precision=0,
                         label="DBSCAN min samples",
-                        info="Min points to form a cluster. Usually keep at 2.")
+                        info="Usually keep at 2.")
                     max_per_class_p1 = gr.Number(value=100, precision=0,
                         label="Max crops per class",
-                        info="Hard cap on saved crops. Cluster reps + diverse outliers up to this limit.")
+                        info="Hard cap on saved crops.")
                 with gr.Row():
                     auto_tune_p1 = gr.Checkbox(value=False,
                         label="Auto-tune DBSCAN eps",
-                        info="Finds optimal eps via k-nearest-neighbors on the embeddings. Overrides eps number above.")
+                        info="kNN-based, overrides eps above.")
                     auto_tune_percentile_p1 = gr.Number(value=85, precision=0,
                         label="KNN percentile",
-                        info="Percentile of k-NN distances used to set eps. 85 = slightly above median cluster tightness.")
+                        info="kNN distance percentile for eps.")
                     batch_size_p1 = gr.Slider(8, 64, value=32, step=8,
                         label="DINOv2 batch size",
-                        info="Embedding batch size. Reduce if VRAM OOM during clustering.")
+                        info="Reduce if VRAM OOM.")
 
             crop_mode.change(
                 lambda m: gr.update(visible=(m == "Unique crops (clustered)")),
@@ -576,7 +596,7 @@ def build_app():
                 skip_crops_dir = gr.Textbox(
                     label="Existing crops folder",
                     placeholder="D:/my_crops  (must contain cls0/, cls1/, ... subfolders)",
-                    info="If you already extracted crops, point here and skip Step 1 extraction entirely.",
+                    info="Skip extraction, use these.",
                 )
                 skip_crops_browse_btn = gr.Button("📂", scale=0, min_width=40)
             skip_to_p2_btn = gr.Button("Skip extraction → Go to Pipeline", variant="secondary")
@@ -616,14 +636,14 @@ def build_app():
                 source_images_dir_p2 = gr.Textbox(
                     label="Source images folder (labelled seed frames)",
                     placeholder="Auto-filled from Step 1",
-                    info="Folder containing the labelled source images used to extract seed crops. Auto-filled from Step 1.",
+                    info="Source of seed crops.",
                 )
                 source_images_browse_btn_p2 = gr.Button("📂", scale=0, min_width=40)
             with gr.Row():
                 source_labels_dir_p2 = gr.Textbox(
                     label="Source labels folder",
                     placeholder="Auto-filled from Step 1",
-                    info="YOLO .txt labels for the source images above. Auto-filled from Step 1 — change if different.",
+                    info="Labels for source images above.",
                 )
                 source_labels_browse_btn_p2 = gr.Button("📂", scale=0, min_width=40)
             with gr.Row():
@@ -638,49 +658,58 @@ def build_app():
             with gr.Row():
                 yoloe_conf = gr.Number(value=0.06, precision=3,
                     label="YOLOe confidence",
-                    info="Min detection confidence for YOLOe proposals. Lower = more proposals (noisier). 0.06 confirmed working.")
+                    info="Lower = more proposals, noisier.")
                 nms_iou = gr.Number(value=0.45, precision=3,
                     label="NMS IoU",
-                    info="IoU threshold for non-max suppression inside YOLOe and WBF clustering. Higher = fewer merges.")
+                    info="Higher = fewer merges.")
                 yoloe_batch_size = gr.Slider(1, 32, value=8, step=1,
                     label="YOLOe target batch size",
-                    info="Targets processed per YOLOe call (after VPE bake-in). Higher = faster but more VRAM. 8 is safe for 8GB.")
+                    info="Higher = faster, more VRAM.")
 
             gr.Markdown("### DINOv2 scoring")
             with gr.Row():
                 dino_thresh = gr.Number(value=0.65, precision=3,
                     label="DINOv2 similarity threshold",
-                    info="Min cosine similarity (masked-patch pooling) to keep a proposal. Below this = dropped before WBF.")
+                    info="Min cosine sim to keep proposal.")
                 dino_batch_size = gr.Slider(4, 64, value=32, step=4,
                     label="DINOv2 batch size",
-                    info="Embedding batch size. Reduce if VRAM OOM during DINOv2 phase.")
+                    info="Reduce if VRAM OOM.")
                 small_obj_thresh = gr.Number(value=0.02, precision=4,
                     label="Small object threshold",
-                    info="Classes with p90 bbox area (w×h normalised) below this use CLS-token embedding instead of masked-patch pooling. Raise for tiny classes like gloves.")
+                    info="p90 bbox area below -> CLS embed.")
+            with gr.Row():
+                no_mask_classes_p2 = gr.Dropdown(
+                    label="Force no-mask classes",
+                    choices=[], multiselect=True, interactive=False,
+                    info="Hard-to-segment classes -> same as small-object.",
+                )
+                no_preview_p2 = gr.Checkbox(value=False,
+                    label="Skip preview images",
+                    info="Labels only, no preview JPGs.")
 
             gr.Markdown("### WBF + filtering")
             with gr.Row():
                 wbf_score = gr.Number(value=0.10, precision=3,
                     label="WBF min score",
-                    info="Min consolidated score (0.3*yoloe + 0.7*dino, fused by WBF) to keep a box. Low value keeps all candidates visible in Panel 2.")
+                    info="0.3*yoloe + 0.7*dino gate.")
                 result_panel3_thresh = gr.Number(value=0.5, precision=3,
                     label="Result display threshold (Panel 3)",
-                    info="WBF boxes above this score shown in Panel 3 (cyan). Pre-containment result gate.")
+                    info="WBF score cutoff, pre-containment.")
                 final_containment_thresh = gr.Number(value=0.7, precision=3,
                     label="Containment filter threshold (Panel 4)",
-                    info="If intersection/min_area > this, lower-scoring nested box is dropped. Panel 4 shows final result.")
+                    info="Nested-box overlap cutoff.")
 
             gr.Markdown("### SAM2")
             with gr.Row():
                 sam2_mask_padding = gr.Number(value=0.05, precision=3,
                     label="SAM2 bbox padding",
-                    info="Fractional padding added to bbox before prompting SAM2. Helps SAM2 see object edges.")
+                    info="Bbox padding before SAM2 prompt.")
                 sam_score_min = gr.Number(value=0.50, precision=3,
                     label="SAM2 min score",
-                    info="Min SAM2 mask quality score to accept a reference crop mask. Low scores = poor segmentation.")
+                    info="Min mask quality to accept.")
                 sam_area_min = gr.Number(value=0.10, precision=3,
                     label="SAM2 min area ratio",
-                    info="Min ratio of mask pixels / bbox area. Filters masks that barely cover the object.")
+                    info="Min mask/bbox area ratio.")
 
             run_pipeline_btn = gr.Button("▶ Run Pipeline", variant="primary")
             pipeline_log = gr.Textbox(label="Log", lines=15, interactive=False, autoscroll=True)
@@ -697,8 +726,7 @@ def build_app():
                 classes_txt_p2b = gr.Textbox(
                     label="classes.txt path (optional)",
                     placeholder="D:/project/classes.txt",
-                    info="YOLO names file, one class per line. If given, class names are shown "
-                         "instead of ids in 'Discover classes' and in the preview panels/legends.",
+                    info="Optional — shows class names instead of ids.",
                 )
                 classes_browse_btn_p2b = gr.Button("📂 Browse", scale=0)
 
@@ -706,14 +734,14 @@ def build_app():
                 refs_dir_p2b = gr.Textbox(
                     label="Reference images folder",
                     placeholder="D:/project/labelled_ref_images",
-                    info="Full labelled reference images (not crops) — SAM3 needs the whole frame to build the canvas.",
+                    info="Full images, not crops.",
                 )
                 refs_dir_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
             with gr.Row():
                 refs_labels_dir_p2b = gr.Textbox(
                     label="Reference labels folder",
                     placeholder="Auto-filled from refs folder",
-                    info="YOLO .txt labels, same stem as reference images.",
+                    info="Same stem as ref images.",
                 )
                 refs_labels_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
 
@@ -723,7 +751,7 @@ def build_app():
                 class_dropdown_p2b = gr.Dropdown(
                     label="Classes to annotate",
                     choices=[], multiselect=True, interactive=False,
-                    info="Leave empty to auto-discover + use every class id found in the labels.",
+                    info="Empty = all discovered classes.",
                 )
                 load_classes_btn_p2b = gr.Button("Discover classes", variant="secondary", scale=0)
 
@@ -738,7 +766,7 @@ def build_app():
                 output_dir_p2b = gr.Textbox(
                     label="Output folder",
                     value="output_sam3_dinov2",
-                    info="Results saved here: labels/<stem>.txt, <stem>.png (root), temp_refs/cls<id>/",
+                    info="labels/, <stem>.png, temp_refs/",
                 )
                 output_browse_btn_p2b = gr.Button("📂", scale=0, min_width=40)
 
@@ -746,61 +774,73 @@ def build_app():
             with gr.Row():
                 orientation_p2b = gr.Radio(choices=["vertical", "horizontal"], value="vertical",
                     label="Canvas orientation",
-                    info="How ref and target halves are stacked on the shared canvas.")
+                    info="Ref/target canvas layout.")
                 split_ratio_p2b = gr.Number(value=0.5, precision=2,
                     label="Split ratio",
-                    info="Fraction of canvas given to the ref half. 0.5 = even split.")
+                    info="Ref half fraction. 0.5=even.")
                 canvas_size_p2b = gr.Slider(504, 1512, value=1008, step=126,
                     label="Canvas size (px)",
-                    info="Square canvas side length SAM3 processes.")
+                    info="Square side, px.")
 
             gr.Markdown("### SAM3")
             with gr.Row():
                 threshold_p2b = gr.Number(value=0.6, precision=3,
                     label="SAM3 score threshold",
-                    info="post_process_instance_segmentation score gate.")
+                    info="Score gate.")
                 batch_size_p2b = gr.Slider(1, 16, value=8, step=1,
                     label="Target batch size",
-                    info="Targets per SAM3 forward pass (same ref group). Lower if OOM on 8GB VRAM.")
+                    info="Lower if OOM.")
                 fp32_p2b = gr.Checkbox(value=False,
                     label="Force fp32",
-                    info="Default is bf16 on CUDA. Check to disable.")
+                    info="Default bf16 on CUDA.")
 
             gr.Markdown("### Diverse ref selection (DINOv2)")
             with gr.Row():
                 max_refs_p2b = gr.Number(value=5, precision=0,
-                    label="Max refs per class (SAM3 exemplars)",
-                    info="SAM3 exemplar ref_groups — subset of the DINOv2 proto-bank pool below. Small since SAM3 is expensive. 0 = use all.")
+                    label="Max refs/class (SAM3)",
+                    info="SAM3 exemplar subset. 0=all.")
                 dino_proto_size_p2b = gr.Number(value=100, precision=0,
                     label="DINOv2 proto bank size",
-                    info="Ref crops per class in the DINOv2 proto bank, farthest-point sampled. Bigger than max-refs — DINOv2 embedding is cheap. 0 = use all.")
+                    info="Ref crops/class, FPS-sampled. 0=all.")
                 dinov2_batch_size_p2b = gr.Slider(4, 64, value=32, step=4,
                     label="DINOv2 batch size",
-                    info="Used for both ref embedding and target box scoring.")
+                    info="Ref embed + target scoring.")
                 phash_max_dist_p2b = gr.Slider(0, 20, value=4, step=1,
                     label="Phash max dist",
-                    info="Near-duplicate ref crop dedup before DINOv2 embedding. Calibrated default 4 — cheap, always removes dupes first. 0 = disabled.")
+                    info="Ref dedup dist. 0=off.")
+            with gr.Row():
                 ref_jpeg_quality_p2b = gr.Slider(50, 100, value=80, step=5,
                     label="Ref crop JPEG quality",
-                    info="Quality for saved crops in output_dir/temp_refs/.")
+                    info="Saved to temp_refs/.")
                 small_obj_thresh_p2b = gr.Number(value=0.01, precision=4,
                     label="Small-object threshold",
-                    info="p90 ref bbox area below this -> class skips SAM3 masking, DINOv2 uses CLS-on-raw-crop. Same default as Pipeline A.")
+                    info="p90 bbox area below -> skip mask, CLS embed.")
+                ref_box_padding_p2b = gr.Number(value=0.01, precision=3,
+                    label="Ref box padding",
+                    info="Fractional pad on ref box.")
+                no_mask_classes_p2b = gr.Dropdown(
+                    label="Force no-mask classes",
+                    choices=[], multiselect=True, interactive=False,
+                    info="Hard-to-segment classes -> same as small-object.",
+                )
+                no_preview_p2b = gr.Checkbox(value=False,
+                    label="Skip preview images",
+                    info="Labels only, no 3-panel figure.")
 
-            gr.Markdown("### SAM3+DINOv2 gate (runs right after SAM3, before containment/dup filter)")
+            gr.Markdown("### SAM3+DINOv2 gate")
             with gr.Row():
                 sam3_dino_thresh_p2b = gr.Number(value=0.2, precision=3,
                     label="SAM3+DINOv2 combined threshold",
-                    info="Gate on combined_score = 0.2*sam3_score + 0.8*dino_sim, before containment/dup filter. Panel 2 (solid=kept, dashed=rejected).")
+                    info="0.2*sam3 + 0.8*dino gate.")
 
-            gr.Markdown("### Duplicate + containment filter (final stage, runs on DINOv2 survivors)")
+            gr.Markdown("### Duplicate + containment filter")
             with gr.Row():
                 dup_iou_p2b = gr.Number(value=0.85, precision=3,
                     label="Duplicate IoU",
-                    info="Above this IoU, the lower-score of two SAM3 proposals (same class+target) is dropped — no merge/averaging.")
+                    info="Above -> drop lower-score box.")
                 containment_thresh_p2b = gr.Number(value=0.85, precision=3,
                     label="Containment threshold",
-                    info="Fully-inside-another-box ratio above which the lower-score box is dropped.")
+                    info="Nested-box ratio cutoff.")
 
             run_sam3_btn = gr.Button("▶ Run SAM3 Pipeline", variant="primary")
             sam3_log = gr.Textbox(label="Log", lines=15, interactive=False, autoscroll=True)
@@ -869,7 +909,7 @@ def build_app():
             inputs=[classes_txt_p1, images_dir_p1, labels_dir_p1],
             outputs=[*PAGE_OUTPUTS, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2, crops_dir_state],
         ).then(
-            update_pipeline_classes, classes_txt_p2, class_dropdown_p2
+            update_pipeline_classes, classes_txt_p2, [class_dropdown_p2, no_mask_classes_p2]
         )
 
         back_to_p1.click(lambda: show_only("page1"), outputs=PAGE_OUTPUTS)
@@ -896,7 +936,7 @@ def build_app():
 
         # Class loading
         load_classes_btn.click(update_class_dropdown, classes_txt_p1, class_dropdown_p1)
-        load_classes_btn_p2.click(update_pipeline_classes, classes_txt_p2, class_dropdown_p2)
+        load_classes_btn_p2.click(update_pipeline_classes, classes_txt_p2, [class_dropdown_p2, no_mask_classes_p2])
 
         # Crop extraction
         run_crops_btn.click(
@@ -925,7 +965,7 @@ def build_app():
             do_skip,
             inputs=[skip_crops_dir, classes_txt_p1, images_dir_p1, labels_dir_p1],
             outputs=[*PAGE_OUTPUTS, crops_dir_state, classes_txt_p2, source_images_dir_p2, source_labels_dir_p2],
-        ).then(update_pipeline_classes, classes_txt_p2, class_dropdown_p2)
+        ).then(update_pipeline_classes, classes_txt_p2, [class_dropdown_p2, no_mask_classes_p2])
 
         # Pipeline (YOLOe)
         run_pipeline_btn.click(
@@ -938,13 +978,14 @@ def build_app():
                 dino_thresh, result_panel3_thresh, final_containment_thresh,
                 sam2_mask_padding, sam_score_min, sam_area_min,
                 dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir_p2,
+                no_mask_classes_p2, no_preview_p2,
             ],
             outputs=[pipeline_log, next_to_p3, result_images_state],
         )
 
         # Pipeline (SAM3)
         classes_browse_btn_p2b.click(browse_file, outputs=classes_txt_p2b)
-        load_classes_btn_p2b.click(update_sam3_classes, [refs_labels_dir_p2b, classes_txt_p2b], class_dropdown_p2b)
+        load_classes_btn_p2b.click(update_sam3_classes, [refs_labels_dir_p2b, classes_txt_p2b], [class_dropdown_p2b, no_mask_classes_p2b])
 
         run_sam3_btn.click(
             run_sam3_pipeline,
@@ -955,6 +996,7 @@ def build_app():
                 max_refs_p2b, dino_proto_size_p2b, dinov2_batch_size_p2b, phash_max_dist_p2b,
                 dup_iou_p2b, containment_thresh_p2b, sam3_dino_thresh_p2b,
                 fp32_p2b, ref_jpeg_quality_p2b, small_obj_thresh_p2b,
+                no_mask_classes_p2b, no_preview_p2b, ref_box_padding_p2b,
             ],
             outputs=[sam3_log, next_to_p3_from_2b, result_images_state],
         )

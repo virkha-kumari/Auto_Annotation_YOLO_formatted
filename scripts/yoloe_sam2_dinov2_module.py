@@ -537,6 +537,12 @@ def parse_args():
     p.add_argument("--small-obj-thresh",     type=float, default=0.01,
                    help="Classes with p90 bbox area (w*h normalised) below this skip SAM2 "
                         "and use mean-pool embedding on raw bbox crop instead of masked-patch pooling.")
+    p.add_argument("--no-mask-classes",      nargs="+", type=int, default=[],
+                   help="Class IDs to force into small-object handling (skip SAM2, mean-pool on raw "
+                        "bbox crop for DINOv2) regardless of --small-obj-thresh. For classes too "
+                        "hard/unreliable to mask (e.g. thin/reflective/occluded objects).")
+    p.add_argument("--no-preview",           action="store_true",
+                   help="Skip saving preview JPGs — labels/summary.json only.")
     p.add_argument("--yoloe-model",          default=YOLOE_MODEL_ID)
     p.add_argument("--yoloe-batch-size",     type=int,   default=8,
                    help="Targets per YOLOe predict call after VPE bake-in (default 8).")
@@ -595,6 +601,10 @@ def main():
         print(f"[cls{cls_id}] p90 bbox area={p90:.5f} → {mode}")
         if p90 < args.small_obj_thresh:
             small_cls.add(cls_id)
+    forced = set(args.no_mask_classes) & set(args.class_ids)
+    if forced:
+        print(f"[no-mask-classes] forcing small-object handling for cls: {sorted(forced)}")
+        small_cls |= forced
 
     class_ids  = sorted(class_source_groups.keys())
     idx_to_cls = {i: c for i, c in enumerate(class_ids)}
@@ -742,11 +752,12 @@ def main():
         preview_path = output_dir / f"{target_path.stem}_preview.jpg"
 
         save_yolo_label(boxes_by_cls, iw, ih, label_path)
-        save_preview(target_img, boxes_by_cls, preview_path)
+        if not args.no_preview:
+            save_preview(target_img, boxes_by_cls, preview_path)
 
         summary[target_name] = {
             "label_file":   str(label_path),
-            "preview_file": str(preview_path),
+            "preview_file": None if args.no_preview else str(preview_path),
             "classes":      cls_summary,
             "n_final_total": sum(len(b) for b, _ in boxes_by_cls.values()),
         }

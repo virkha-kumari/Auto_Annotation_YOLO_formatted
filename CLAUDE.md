@@ -39,8 +39,9 @@ Used across multiple industrial computer vision projects.
 - **Pipeline VRAM order** — YOLOe (all targets, batched) → unload → SAM2 (refs + all target proposals) → unload → DINOv2 (embed + score all) → unload → WBF + output.
 - **Batched YOLOe** — outer=stems, inner=target batches. `get_vpe` bakes VPE once per stem, `predict(source=[batch])` runs plain detection on all targets. 2.91× speedup confirmed.
 - **`scripts/yoloe_sam2_dinov2_module.py`** (formerly `auto_annotate.py`) — BUILT AND WORKING. Multi-class, batched, small-obj-aware. Pipeline A.
-- **`scripts/sam3_dinov2_module.py`** — BUILT AND WORKING (integrated 2026-07-14). Canvas-composite few-shot, no crop-extraction step. Order: SAM3 proposals → combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) → containment+dup filter. Pipeline B. DINOv2 scoring now masked-patch pooling (SAM3's own masks reused for proposals; ref crops box-prompted through SAM3 too) + max-sim vs proto bank, matching Pipeline A's approach — same small-object CLS fallback (`--small-obj-thresh`) (2026-07-20).
+- **`scripts/sam3_dinov2_module.py`** — BUILT AND WORKING (integrated 2026-07-14). Canvas-composite few-shot, no crop-extraction step. Order: SAM3 proposals → combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) → containment+dup filter. Pipeline B. DINOv2 scoring now masked-patch pooling (SAM3's own masks reused for proposals; ref crops box-prompted through SAM3 too) + max-sim vs proto bank, matching Pipeline A's approach — same small-object CLS fallback (`--small-obj-thresh`) (2026-07-20). Ref bbox padding (`--ref-box-padding`, default 0.01) added 2026-07-23 to fix fingertip/thin-extremity clipping from tight ref boxes.
 - **`app.py`** — Gradio wizard wrapping both pipelines. Landing page picks Pipeline A or B. WORKING.
+- **No-mask override + skip preview** (2026-07-23, both pipelines) — `--no-mask-classes` forces explicit class ids into small-object handling regardless of `--small-obj-thresh`. `--no-preview` skips preview image save (labels + summary.json still written, `preview_file: null`). Wired into app.py for both pipelines.
 
 ---
 
@@ -68,7 +69,7 @@ Used across multiple industrial computer vision projects.
 - **No text prompts anywhere** — pipeline is purely visual
 - **Keep outlier clusters** — occluded/unusual views are valid
 - **Monolith first** — keep each pipeline module (`scripts/yoloe_sam2_dinov2_module.py`, `scripts/sam3_dinov2_module.py`) as one script until design stabilizes
-- **Human review via PIL preview** — no Label Studio or CVAT integration planned
+- **Human review via PIL preview** — no Label Studio or CVAT integration planned (optional via `--no-preview`, labels-only mode)
 - **Device-independent code always** — never hardcode cache paths; code must run on any machine
 - **VRAM rule** — never load two large models simultaneously (see below)
 - **Embedding consistency** — refs and proposals for each class must use identical embedding method. If a class uses CLS mode, both proto bank and proposals use CLS. Never mix methods within a class.
@@ -149,6 +150,8 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - SAM2 mask padding: `0.05`
 - SAM2 score min: `0.50`
 - SAM2 area min: `0.10`
+- Force no-mask classes (`--no-mask-classes`): none by default
+- Skip preview (`--no-preview`): off by default
 
 ### Pipeline B (SAM3/DINOv2)
 
@@ -160,6 +163,9 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - Max refs per class for SAM3 exemplars (`--max-refs-per-class`): `5`
 - DINOv2 proto bank size (`--dino-proto-size`): `100`
 - Phash dedup distance (`--phash-max-dist`): `4`
+- Ref bbox padding (`--ref-box-padding`): `0.01` (fractional, clamped to image bounds)
+- Force no-mask classes (`--no-mask-classes`): none by default
+- Skip preview (`--no-preview`): off by default
 
 ---
 

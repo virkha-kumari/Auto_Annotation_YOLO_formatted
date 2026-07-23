@@ -7,6 +7,19 @@ Format:
 
 ---
 
+## 2026-07-23
+
+### ADDED — `--no-mask-classes`, `--no-preview` (both pipelines), `--ref-box-padding` (Pipeline B)
+
+- `--no-mask-classes` (int list) — forces explicit class ids into small-object handling (skip mask usage, DINOv2 CLS-on-raw-crop) regardless of `--small-obj-thresh` auto-detection. Unions into the existing `small_cls` set in both `yoloe_sam2_dinov2_module.py` and `sam3_dinov2_module.py`. For classes too hard/unreliable to mask reliably (thin, reflective, occluded).
+- `--no-preview` — skips preview image save (Pipeline A: `_preview.jpg`; Pipeline B: 3-panel `.png`, proposal mask-overlay debug jpgs in `temp_refs/` unaffected). Labels + `summary.json` always written; `preview_file` becomes `null` when set.
+- `--ref-box-padding` (Pipeline B only, default `0.01`, fractional, clamped to image bounds) — pads ref bbox at source in `collect_ref_boxes()`. Flows into SAM3 canvas exemplar prompt, SAM3 own-image box-prompt for ref masking, and ref crop for CLS embed. Fixes fingertip/thin-extremity clipping from tight ref boxes.
+- `app.py` — both pipeline pages get "Force no-mask classes" (Dropdown, multiselect, same choices source as class selector) and "Skip preview images" (Checkbox); Pipeline B page also gets "Ref box padding" (Number). `collect_results`/`run_pipeline`/`run_sam3_pipeline` gallery readers updated to handle `preview_file: null` without crashing.
+
+**Status:** smoke-tested, confirmed working.
+
+---
+
 ## 2026-07-20
 
 ### ADDED — Masked-patch DINOv2 scoring for Pipeline B (`scripts/sam3_dinov2_module.py`)
