@@ -1,22 +1,24 @@
 """
-Evaluate auto_annotate.py output against ground-truth YOLO labels.
+Evaluate pipeline output (Pipeline A or B) against ground-truth YOLO labels.
 Requires Python 3.10+.
 
 Computes per-class and overall:
   - Precision, Recall, F1 @ configurable IoU (default 0.50)
   - AP@0.50  (101-point interpolation)
-  - mAP@0.50:0.95  (COCO-style, 10 thresholds averaged; classes with 0 GT excluded)
+  - mAP@0.50:0.95  (COCO-style, 10 thresholds averaged)
+  Classes with 0 GT are excluded from mAP. Classes with GT but 0 predictions count as AP = 0.
 
 Usage:
     python scripts/eval_map.py \\
-        --preds   "D:/output"               \\  # auto_annotate output (.txt + summary.json)
+        --preds   "D:/output"               \\  # predicted .txt dir (Pipeline B: output/labels)
         --gt      "D:/dataset/labels/train"  \\  # ground-truth YOLO .txt dir
         --classes helmet gloves vest         \\  # names in class-id order
         [--iou-thresh 0.50]                  \\  # IoU threshold for P/R/F1 row
-        [--images  "D:/dataset/images/train"]    # optional: enumerate target stems from here
+        [--images  "D:/dataset/images/train"] \\ # optional: enumerate target stems from here
+        [--out-json metrics.json]                # optional: write metrics as JSON
 
 Box format (pred + GT):  standard YOLO .txt — <cls_id> <cx> <cy> <w> <h>  (normalised)
-Scores: read from summary.json if present in preds dir; otherwise uniform 1.0.
+Scores: read from summary.json in preds dir or its parent; otherwise uniform 1.0.
 """
 
 from __future__ import annotations
@@ -74,10 +76,10 @@ def load_summary_scores(summary_path: Path) -> dict[str, dict[int, list[float]]]
     """Returns {stem: {cls_id: [score, ...]}} from a pipeline's summary.json.
 
     Pipeline A shape: {stem: {"classes": {cls_str: {"boxes": [{"score": ...}, ...]}}}}
-    Pipeline B shape: {stem: {"boxes": [{"class_id": ..., "combined_score": ...}, ...]}} (flat, no "classes"
-    nesting) — score is combined_score (0.2*sam3_score + 0.8*dino_sim, the same value the pipeline's own
-    gate ranks/drops on), not sam3_score alone, since sam3_score is raw objectness/mask-quality, not
-    class-discriminative."""
+    Pipeline B shape: {stem: {"boxes": [{"class_id": ..., "final_score": ..., "combined_score": ...}, ...]}}
+    (flat, no "classes" nesting) — score is final_score (combined_score × ref-group vote fraction, the
+    pipeline's final ranking), falling back to combined_score for older summaries; never sam3_score alone,
+    which is raw objectness/mask-quality, not class-discriminative."""
     if not summary_path.exists():
         return {}
     data = json.loads(summary_path.read_text())
@@ -92,7 +94,7 @@ def load_summary_scores(summary_path: Path) -> dict[str, dict[int, list[float]]]
         else:
             by_cls: dict[int, list[float]] = {}
             for b in info.get("boxes", []):
-                score = b.get("combined_score")
+                score = b.get("final_score", b.get("combined_score"))
                 by_cls.setdefault(b["class_id"], []).append(score if score is not None else 0.0)
             out[stem] = by_cls
     return out
@@ -206,6 +208,7 @@ def evaluate(
     class_names: list[str],
     report_iou:  float,
     images_dir:  Path | None,
+    out_json:    Path | None = None,
 ) -> None:
 
     # Enumerate stems
@@ -219,7 +222,12 @@ def evaluate(
         )
 
     n_cls = len(class_names)
-    summary_scores = load_summary_scores(preds_dir / "summary.json")
+    # Pipeline B writes labels to output/labels/ and summary.json to output/
+    summary_path = preds_dir / "summary.json"
+    if not summary_path.exists():
+        summary_path = preds_dir.parent / "summary.json"
+    summary_scores = load_summary_scores(summary_path)
+    print(f"[scores] {summary_path if summary_path.exists() else 'no summary.json — uniform 1.0'}")
 
     # Build per-image pred/GT dicts
     # preds_by_img[stem][cls_id] = [(score, xyxy), ...] sorted desc by score
@@ -263,6 +271,7 @@ def evaluate(
 
     all_ap50:    list[float] = []
     all_ap_coco: list[float] = []
+    per_class:   dict[str, dict] = {}
     per_img_stats: dict[str, dict[int, dict]] = {s: {} for s in stems}
 
     for cls_id in range(n_cls):
@@ -293,8 +302,11 @@ def evaluate(
         rec  = tp_total / (tp_total + fn_total) if n_gt_total else 0.0
         f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
 
-        # AP: global confidence-sorted pass (see global_tp_flags docstring)
-        if n_pred_total > 0 and n_gt_total > 0:
+        # AP: global confidence-sorted pass (see global_tp_flags docstring).
+        # GT present but no predictions → AP = 0 (COCO); 0 GT → NaN, excluded from mAP.
+        if n_gt_total > 0 and n_pred_total == 0:
+            ap50 = ap_coco = 0.0
+        elif n_gt_total > 0:
             ap50 = compute_ap_101(
                 global_tp_flags(stems, preds_by_img, gts_by_img, cls_id, 0.50),
                 n_gt_total,
@@ -316,11 +328,14 @@ def evaluate(
             print(f"  {class_names[cls_id]:<14}  [excluded from mAP — 0 GT instances in this eval set]")
             continue
 
-        ap50_s = f"{ap50:.3f}"   if not np.isnan(ap50)   else "  N/A "
-        coc_s  = f"{ap_coco:.3f}" if not np.isnan(ap_coco) else "   N/A  "
+        per_class[class_names[cls_id]] = {
+            "precision": prec, "recall": rec, "f1": f1, "ap50": ap50, "ap50_95": ap_coco,
+            "n_pred": n_pred_total, "n_gt": n_gt_total,
+        }
         print(f"  {class_names[cls_id]:<14} {prec:>6.3f} {rec:>6.3f} {f1:>6.3f}"
-              f"  {ap50_s:>7} {coc_s:>10}  {n_pred_total:>6} {n_gt_total:>6}")
+              f"  {ap50:>7.3f} {ap_coco:>10.3f}  {n_pred_total:>6} {n_gt_total:>6}")
 
+    n_classes_in_map = int(np.sum(~np.isnan(all_ap50)))
     map50    = float(np.nanmean(all_ap50))
     map_coco = float(np.nanmean(all_ap_coco))
     tot_pred = sum(len(preds_by_img[s].get(c, [])) for s in stems for c in range(n_cls))
@@ -329,7 +344,17 @@ def evaluate(
     print(f"{'─'*76}")
     print(f"  {'ALL':<14} {'':>6} {'':>6} {'':>6}  {map50:>7.3f} {map_coco:>10.3f}"
           f"  {tot_pred:>6} {tot_gt:>6}")
+    print(f"  mAP averaged over {n_classes_in_map} class(es) with GT present")
     print(f"{'─'*76}\n")
+
+    if out_json:
+        out_json.write_text(json.dumps({
+            "n_images": len(stems), "iou_thresh_prf": report_iou,
+            "map50": map50, "map50_95": map_coco, "n_classes_in_map": n_classes_in_map,
+            "n_pred": tot_pred, "n_gt": tot_gt,
+            "per_class": {k: v for k, v in per_class.items() if v["n_gt"] > 0},
+        }, indent=2))
+        print(f"[saved] {out_json}")
 
     # ── Per-image breakdown ───────────────────────────────────────────────────
     print(f"Per-image breakdown @ IoU={report_iou:.2f}  (tp/fp/fn per class)\n")
@@ -359,6 +384,7 @@ def main() -> None:
     parser.add_argument("--iou-thresh", type=float, default=0.50, dest="iou_thresh",
                         help="IoU threshold for P/R/F1 report row (default 0.50)")
     parser.add_argument("--images",     default=None,   help="Images dir for stem enumeration")
+    parser.add_argument("--out-json",   default=None,   help="Write metrics JSON here")
     args = parser.parse_args()
 
     evaluate(
@@ -367,6 +393,7 @@ def main() -> None:
         class_names = args.classes,
         report_iou  = args.iou_thresh,
         images_dir  = Path(args.images) if args.images else None,
+        out_json    = Path(args.out_json) if args.out_json else None,
     )
 
 

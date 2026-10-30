@@ -25,7 +25,8 @@ Usage:
         --max-per-class-crops 100
 
 Each saved crop is named:
-    <frame_stem>_cls<class_id>_<ann_idx>.jpg
+    <frame_stem>_cls<class_id>_<line_idx>.jpg
+line_idx = raw line index in the label file, so downstream pipelines resolve the exact instance.
 """
 
 import argparse
@@ -294,14 +295,14 @@ def main():
         if not label_path.exists():
             continue
         annotations = []
-        for line in label_path.read_text().splitlines():
+        for line_idx, line in enumerate(label_path.read_text().splitlines()):
             parts = line.strip().split()
             if len(parts) < 5:
                 print(f"[warn] Skipping malformed line in {label_path}: {line}")
                 continue
             cid = int(parts[0])
             if cid in target_set:
-                annotations.append((len(annotations), cid,
+                annotations.append((line_idx, cid,
                                      float(parts[1]), float(parts[2]),
                                      float(parts[3]), float(parts[4])))
         if annotations:

@@ -1,7 +1,7 @@
 """
 Test: can we call get_vpe + set_classes once per stem, then batch all targets?
 Usage:
-    python test/test_yoloe_batch.py \
+    python experiments/test_yoloe_batch.py \
         --queries "D:/path/to/crops/cls0" \
         --targets-dir "D:/path/to/targets" \
         --source-images "D:/path/to/source" \

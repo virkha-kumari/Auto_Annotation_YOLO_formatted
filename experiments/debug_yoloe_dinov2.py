@@ -9,7 +9,7 @@ For each source group:
 VRAM rule: YOLOe runs first (all images), then del + empty_cache, then DINOv2 loads.
 Saves each figure to output_results/ in cwd.
 
-python test/debug_yoloe_dinov2.py --queries "path/to/crops/cls0" --target "path/to/target.jpg" --source-images "path/to/source/images" --labels "path/to/source/labels"
+python experiments/debug_yoloe_dinov2.py --queries "path/to/crops/cls0" --target "path/to/target.jpg" --source-images "path/to/source/images" --labels "path/to/source/labels"
 
 """
 

@@ -25,7 +25,7 @@ sample of N diverse refs per class (0 = all), saved to output_dir/temp_refs/
 for inspection (DINOv2 loaded/unloaded before SAM3, VRAM rule).
 
 Usage:
-    python test/debug_sam3.py \\
+    python experiments/debug_sam3.py \\
         --refs-dir    "D:/path/to/labelled_ref_images" \\
         --refs-labels "D:/path/to/labelled_ref_images"  (YOLO .txt, same stem) \\
         --class-ids   0 1 2 \\

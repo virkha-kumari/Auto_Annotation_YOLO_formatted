@@ -6,7 +6,7 @@ For each query crop:
   2. Run YOLOe visual-prompt detection on target (conf=0.01)
   3. Show side-by-side: source with ref bboxes | target with proposals
 
-python test/debug_yoloe.py --queries "path/to/crops/cls0" --target "path/to/target.jpg" --source-images "path/to/source/images" --labels "path/to/source/labels"
+python experiments/debug_yoloe.py --queries "path/to/crops/cls0" --target "path/to/target.jpg" --source-images "path/to/source/images" --labels "path/to/source/labels"
 """
 
 import argparse

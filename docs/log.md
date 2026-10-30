@@ -7,6 +7,39 @@ Format:
 
 ---
 
+## 2026-10-30
+
+### FINDING — eval inflated mAP; README timing misread
+
+- `eval_map.py` gave AP=NaN to classes with GT but 0 predictions → `nanmean` dropped them. Pipeline A's README mAP@.50 0.254 / .5:.95 0.093 averaged 6 classes, not 7 (`none`: 20 GT, 0 preds). Correct: **0.218 / 0.080**.
+- Pipeline A printed cumulative time per phase. "SAM2 14m55s" was the cumulative mark; actual SAM2 = 3m53s. YOLOe (11m02s) is the bottleneck, not SAM2.
+- Pipeline B 0.147 table was measured with **no** DINOv2 gate and uniform 1.0 scores (07-15), not the mean-sim config the README claimed.
+- Pipeline A preliminary table: 59 predictions fell in `no_*` classes (0 GT) — README previously listed 0.
+
+### FIXED — correctness, both pipelines
+
+- **DINOv2 mask/patch misalignment** — processor resized short edge to 256 then **center-cropped** 224; masks were mapped onto the full crop. Non-square crops pooled the wrong patches (tall crop: top/bottom cut). Now square resize to 224, no center crop. Patch selection: patches ≥ 50% mask coverage (`INTER_AREA`), else most-covered patch.
+- **Pipeline A mask from pixel values** — mask was rebuilt as `crop > 0`, so black object pixels counted as background. Mask now passed explicitly.
+- **Pipeline A SAM2 single-box chunk** — `SAM2ImagePredictor.predict` squeezes the box dim for 1 box → `raw_masks[k, best]` indexed a row. Shape restored.
+- **Embedding consistency** — no CLS fallback inside masked-patch classes. Pipeline B refs SAM3 fails to mask are dropped from the bank (previously mean-token embedding mixed in).
+- **Pipeline A refs = exact crops** — refs were every box of the class in each selected frame, not the selected crop. Crop names now carry the raw label line index (`extract_crops_labelled.py`, `extract_crops_varied.py`) and Pipeline A resolves exactly that instance. **Old crop folders must be re-extracted.**
+- **Small-object rule from selected refs only** — p90 area computed over the k selected refs (both pipelines), not the whole label folder.
+- `eval_map.py` — AP=0 for GT-without-predictions; finds Pipeline B `summary.json` in parent of `labels/`; ranks B by `final_score`; `--out-json`.
+
+### ADDED — Pipeline B voting + scalability
+
+- **Voting** — duplicates (IoU ≥ `--dup-iou-thresh`) merge into the highest-combined box; `final_score = combined_score × voting_ref_groups / ref_groups`. Containment filter then by `final_score`. Pipeline A keeps single-model WBF average.
+- **Scalable memory** — masks stored box-local + bit-packed, freed after scoring; targets decoded one at a time in scoring/saving (were all held at once); proposal mask overlays saved off-thread and skipped with `--no-preview`.
+- **Per-phase timing** (both pipelines) — printed per phase, `timing.json` written.
+
+### ADDED — k-shot experiment protocol
+
+`experiments/run_kshot.sh` (A + B × k ∈ {15, 30, 50, 100}, same pool `data/label/`, same test `data/test/`, phash 4) + `experiments/summarize_kshot.py` (markdown tables). `test/` renamed `experiments/`. README restructured for research readers; YOLO-11 comparison and backbone-head direction removed. `requirements.txt`: model libs pinned to tested versions, `psutil` added, unused `questionary` removed.
+
+**Status:** unit-checked (eval synthetic case, mask pack/unpack, patch selection, voting); full pipeline runs pending on server.
+
+---
+
 ## 2026-07-23
 
 ### ADDED — `--no-mask-classes`, `--no-preview` (both pipelines), `--ref-box-padding` (Pipeline B)
@@ -32,7 +65,7 @@ Pipeline B's DINOv2 scoring was always CLS-on-raw-crop, same noise problem as Pi
 - `select_diverse_refs` split: CLS embeddings there are diversity-selection ranking only now; actual scoring embeddings (masked or CLS) happen later via `build_proto_banks()` + `score_dets_dinov2()`, after ref masking.
 - Sim aggregation switched mean → max (`(prop_embs @ bank.T).max(dim=1)`) — best-matching ref, matching Pipeline A's approach instead of Pipeline B's earlier "mean is more sane" call.
 - `--sam3-dino-thresh` reset to `0.2` and recalibrated under the new masked-patch/max-sim scoring (the 0.3 value from 2026-07-19 was tuned for the old mean-sim/CLS-on-raw-crop scoring, no longer applicable).
-- Mask overlays (image + translucent mask + box, matching `test/debug_sam3.py`'s panel style) saved to `temp_refs/cls<id>/` for refs (`<name>_mask.jpg`, alongside the raw crop, not overwriting it) and `temp_refs/cls<id>/proposals/` for target proposals.
+- Mask overlays (image + translucent mask + box, matching `experiments/debug_sam3.py`'s panel style) saved to `temp_refs/cls<id>/` for refs (`<name>_mask.jpg`, alongside the raw crop, not overwriting it) and `temp_refs/cls<id>/proposals/` for target proposals.
 - `app.py` — added `--small-obj-thresh` UI control (Page 2b), wired into `run_sam3_pipeline`.
 
 **Status:** 10-image smoke test (`data/test/`, all 11 classes covered) confirmed clean end-to-end run post-fix (one real bug caught and fixed: `del crops` in `embed_masked_crops` was deleting the whole input list instead of the batch slice, crashed on the 2nd batch — renamed to `del batch`). All Pipeline B parameters now calibrated to a consistent state. **Full mAP re-run on `data/test/` not yet done** — the 0.171/0.049 numbers from the 2026-07-19 mean-sim/0.3-thresh config are stale and do not reflect this configuration.
@@ -55,7 +88,7 @@ Also added: optional `--classes-file` (class names in previews/legends instead o
 
 ### FINDING — doc/code audit: stale `utils/` refs, wrong defaults, wrong UI tooltips
 
-Fixed: `--small-obj-thresh` doc default (0.02→0.01, deliberate Pipeline A tune not a typo), `utils/*` → `test/*` stale path refs in README/CLAUDE.md, 3 wrong app.py Page 2b tooltips (output-dir paths, SAM3 API name, dup-IoU behavior).
+Fixed: `--small-obj-thresh` doc default (0.02→0.01, deliberate Pipeline A tune not a typo), `utils/*` → `experiments/*` stale path refs in README/CLAUDE.md, 3 wrong app.py Page 2b tooltips (output-dir paths, SAM3 API name, dup-IoU behavior).
 
 ---
 
@@ -106,7 +139,7 @@ Also deleted `scripts/temp.py` (585-line stale draft/scratch copy of the SAM3 mo
 
 ## 2026-07-10
 
-### ADDED — `test/debug_sam3.py` RAM guard, phash dedup, progress bars, multi-box ref grouping
+### ADDED — `experiments/debug_sam3.py` RAM guard, phash dedup, progress bars, multi-box ref grouping
 
 Sequence of fixes/features driven by a 90%-RAM crash on a full 25-class, 9988-image run:
 
@@ -123,17 +156,17 @@ Sequence of fixes/features driven by a 90%-RAM crash on a full 25-class, 9988-im
 
 **Image count math (not obvious):** total saved figures = `targets × Σ_classes ref_groups_kept_per_class`, where `ref_groups_kept_per_class ≤ max_refs_per_class` (after phash dedup + DINOv2 FPS), and further collapses only when multiple kept refs share a source image. NOT `targets × classes × per_bbox_class` — raw per-class bbox count only matters pre-selection.
 
-### FIXED — `test/debug_sam3.py` bf16 crash: `input_boxes` never cast, dtype mismatch in `boxes_direct_project`
+### FIXED — `experiments/debug_sam3.py` bf16 crash: `input_boxes` never cast, dtype mismatch in `boxes_direct_project`
 
 bf16 pass (below) intentionally left `input_boxes` at fp32 to avoid box-position rounding, but the model's `boxes_direct_project` linear layer is bf16 — crashed with `mat1 and mat2 must have the same dtype, but got Float and BFloat16` inside `Sam3Model.forward` → `geometry_encoder` → `_encode_boxes`.
 
 Fix: cast `inputs["input_boxes"]` to `model.dtype` alongside `pixel_values`. Since `model.dtype` is fp32 whenever `--fp32`/CPU is used, the cast is a no-op on that path — no precision risk there. On bf16, the geometry encoder was already going to run this tensor through bf16 math internally regardless (that's why the uncast tensor didn't work), so the explicit cast doesn't add precision loss beyond what the model already imposes.
 
-**Confirmed working end-to-end** with real dataset (`CarrierInspectionWork/7125`, 5 classes, DINOv2 diverse-ref selection, bf16 batched inference).
+**Confirmed working end-to-end** with a real industrial dataset (5 classes, DINOv2 diverse-ref selection, bf16 batched inference).
 
 **Next:** integrate this canvas-composite few-shot path into `app.py` / `scripts/auto_annotate.py` as an alternative/complement to YOLOe+SAM2+DINOv2.
 
-### ADDED — `test/debug_sam3.py` speed pass: bf16, threaded figure saves, diverse ref selection
+### ADDED — `experiments/debug_sam3.py` speed pass: bf16, threaded figure saves, diverse ref selection
 
 Sweep was slow (refs × targets × classes, fp32, serial matplotlib saves blocking the GPU). Four changes:
 
@@ -148,12 +181,12 @@ Sweep was slow (refs × targets × classes, fp32, serial matplotlib saves blocki
 
 ### DROPPED — SAM2 as few-shot matcher
 
-Considered extending `test/debug_sam2.py` into a SAM2-only few-shot script: ref crops → SAM2 auto-mask → DINOv2 embed/match → apply to test image. Dropped before implementation.
+Considered extending `experiments/debug_sam2.py` into a SAM2-only few-shot script: ref crops → SAM2 auto-mask → DINOv2 embed/match → apply to test image. Dropped before implementation.
 
 **Why dropped:**
 - SAM2 has no native few-shot or class-conditioning capability — it only segments, doesn't recognize. Any "few-shot" behavior would come entirely from DINOv2 similarity matching bolted on top.
 - YOLOe, already the pipeline's detector, has genuine native few-shot support (`get_vpe(refer_image)` bakes visual-prompt embeddings into the model, then detects the same visual concept on new images) — that's why YOLOe was incorporated as proposal generator in the first place, not SAM2. Re-deriving few-shot on SAM2 via DINOv2 would just duplicate what YOLOe already does natively, with a weaker signal.
-- `test/debug_yoloe_sam2_dino.py` already covers ref→proposal→match: YOLOe few-shot detects, SAM2 refines mask, DINOv2 confirms similarity. No new capability from a SAM2-only variant.
+- `experiments/debug_yoloe_sam2_dino.py` already covers ref→proposal→match: YOLOe few-shot detects, SAM2 refines mask, DINOv2 confirms similarity. No new capability from a SAM2-only variant.
 - Redirecting effort to SAM3, which reportedly has native few-shot/visual-concept prompting similar to YOLOe's VPE — worth evaluating directly instead.
 
 **Next:** Evaluate SAM3 few-shot/visual-prompt capability directly.
@@ -165,7 +198,7 @@ Researched SAM3's actual few-shot mechanism (transformers `Sam3Model`/`Sam3Proce
 - Critical limitation: the exemplar box must be drawn on the *same image* being segmented. There is no `refer_image`-style API (unlike YOLOe's `get_vpe`) for "learn from image A, detect in image B."
 - Cross-image few-shot is achievable via a composite-canvas trick from "Few-Shot Semantic Segmentation Meets SAM3" ([WongKinYiu/FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3)): paste reference image + target image into one shared canvas (stacked or side-by-side), remap the reference's known bbox into canvas-normalized coordinates, run SAM3 once on the composite with that box as a positive geometric exemplar, then crop the target's canvas region back out of the prediction and resize to original size.
 
-### ADDED — `test/debug_sam3.py` rewritten: SAM3 canvas-composite few-shot debug script
+### ADDED — `experiments/debug_sam3.py` rewritten: SAM3 canvas-composite few-shot debug script
 
 Replaced the old plain `mask-generation` pipeline (unprompted auto-mask, same dead end as SAM2 — no class-conditioning) with the canvas-composite few-shot approach above.
 
@@ -176,7 +209,7 @@ Replaced the old plain `mask-generation` pipeline (unprompted auto-mask, same de
 
 **Early read:** promising enough to keep refining — first real signal that SAM3 might get closer to a genuine few-shot auto-annotation path (native concept-matching + box exemplar, not YOLOe-visual-prompt-plus-separate-DINOv2-scoring). Still needs: threshold tuning (currently `--threshold`/`--mask-threshold` both loosened to 0.2 for initial visibility), a real accuracy pass across multiple refs/targets (currently qualitative eyeballing only), and a decision on whether canvas-composite overhead (per-pair forward pass, no batching yet) is fast enough to replace or complement YOLOe+SAM2+DINOv2 in `scripts/auto_annotate.py`.
 
-### ADDED — `test/debug_sam3.py`: score + native-box visualization
+### ADDED — `experiments/debug_sam3.py`: score + native-box visualization
 
 `post_process_instance_segmentation()` returns `masks`, `boxes`, `scores` — index-aligned, but `boxes`/`scores` were being dropped on the floor. Now:
 - `scores` tracked alongside masks through the crop-to-target filter (zip preserves alignment), printed per (ref, target) pair, drawn as per-box text labels on panels 3+4, panel titles show the score list + max score.
@@ -184,7 +217,7 @@ Replaced the old plain `mask-generation` pipeline (unprompted auto-mask, same de
 
 **Why this matters:** the mask→bbox path (`mask_to_bbox()` on the cropped/resized mask) and SAM3's own box head can disagree — worth seeing both to judge which is more reliable per case before committing to one for the final auto-annotate integration.
 
-### ADDED — `test/debug_sam3.py`: batched targets-per-ref (speed fix)
+### ADDED — `experiments/debug_sam3.py`: batched targets-per-ref (speed fix)
 
 Was one `model()` forward pass per (ref, target) pair — fully serial, GPU underutilized between calls (I/O + PIL/matplotlib overhead dominating wall time, not GPU compute). Restructured:
 - Outer loop = ref instances, inner loop = target batches of `--batch-size` (default 4).
@@ -194,7 +227,7 @@ Was one `model()` forward pass per (ref, target) pair — fully serial, GPU unde
 
 **Why targets-not-refs:** ref's canvas box is identical across all targets in one batch (only the canvas differs, since target placement always has the same fixed slot); batching refs instead would need a different canvas per ref anyway, so target-batching was the natural axis with no correctness cost.
 
-### ADDED — `test/debug_sam3.py`: multi-class support
+### ADDED — `experiments/debug_sam3.py`: multi-class support
 
 Was single `--class-id` int, one class per run. Now:
 - `--class-ids` accepts explicit list (`--class-ids 0 1 2`) or defaults to `"all"`, which auto-discovers every class id present across `--refs-labels/*.txt` via `discover_class_ids()`.
@@ -233,7 +266,7 @@ Investigated ultralytics source (`predict.py`, `model.py`). Findings:
 - `refer_image` is processed via `get_vpe()` → `set_classes(names, vpe)` which **bakes VPE into model weights**
 - `batch=1` hardcoded in predictor overrides during VP setup (line 399 `model.py`)
 - Docs confirm: "For image-specific prompts, run images individually"
-- Batching targets with same refer_image possible architecturally but `batch` param only works for directory/video/txt source, not list — confirmed no speedup
+- Batching targets with same refer_image possible architecturally but `batch` param only works for directory/video/txt source, not list — confirmed no speedup (**superseded** — see `experiments/test_yoloe_batch.py` entry below: 2.91× once VPE baked and predictor reset)
 
 ### FINDING — cls1 (gloves) 0% DINOv2 pass rate — small object problem
 
@@ -257,9 +290,9 @@ New helper: `make_bbox_crop(img_np, bbox)` — raw PIL crop, no mask, no resize.
 New helper: `median_bbox_area(labels_dir, cls_id)` — median w*h from all label files.  
 `embed_masked_crops()` gains `use_cls: bool` param.
 
-### ADDED — `test/test_yoloe_batch.py`
+### ADDED — `experiments/test_yoloe_batch.py`
 
-Test script comparing Method A (current: 1-target × 1-stem per call) vs Method B (get_vpe once per stem → plain detection on batched targets). Written to benchmark whether YOLOe supports true target batching after VPE bake-in. Method B turned out infeasible (batch param ignored for list source). Script kept for reference.
+Test script comparing Method A (current: 1-target × 1-stem per call) vs Method B (get_vpe once per stem → plain detection on batched targets). Written to benchmark whether YOLOe supports true target batching after VPE bake-in. Method B turned out infeasible (batch param ignored for list source). **Superseded (2026-06-26, later):** after resetting the predictor post-VPE-bake, Method B works — 2.91× speedup, identical proposals (242 vs 242). This is what Pipeline A uses.
 
 ### ADDED — `app.py` major fixes
 
@@ -306,7 +339,7 @@ Full pipeline (no matplotlib): YOLOe → SAM2 → DINOv2 → WBF → containment
 
 Was: `N_sources × N_targets` YOLOe forward passes (one call per source per target).  
 Now: `N_sources` calls total — pass all target paths as list to `yoloe_model.predict(source=[...])`.  
-Result: O(S×T) → O(S). On 50 source frames × 200 targets = ~200× fewer YOLOe forward passes.
+Result: O(S×T) → O(S) predict calls. **Correction:** each call still runs one forward per target image, so forward passes stay S×T; the final batched design makes S × ceil(T / batch) predict calls (2.91× measured wall-clock speedup, not ~200×).
 
 `run_phase1_yoloe()` signature changed: takes `target_paths: list[Path]`, returns `dict[Path, list]` directly.
 
@@ -334,7 +367,7 @@ Dataset: Ultralytics Construction-PPE ([docs](https://docs.ultralytics.com/datas
 
 ## 2026-06-25
 
-### ADDED — `test/debug_yoloe_sam2_dino.py` major refactor: correct VRAM sequencing, consolidated scoring, containment filter, 4-panel viz
+### ADDED — `experiments/debug_yoloe_sam2_dino.py` major refactor: correct VRAM sequencing, consolidated scoring, containment filter, 4-panel viz
 
 **Pipeline order fixed (was broken — SAM2 was loading before YOLOe):**
 - Phase 1: YOLOe loads once → ALL targets processed → YOLOe unloads
@@ -346,8 +379,8 @@ Dataset: Ultralytics Construction-PPE ([docs](https://docs.ultralytics.com/datas
 **Consolidated WBF scoring:**
 - Was: WBF input = DINOv2 sim only
 - Now: WBF input = `0.3 × yoloe_conf + 0.7 × dino_sim` (combined per-box before fusion)
-- WBF then amplifies by vote count (how many source frames agreed on that location)
-- Final score reflects detection confidence + appearance similarity + cross-frame consensus
+- ~~WBF then amplifies by vote count~~ **Correction (2026-10-30):** single-model WBF (`conf_type='avg'`) does not boost by vote count — `min(n_models, n_boxes) / n_models = 1`. Fused score = mean combined score of the cluster.
+- Final score reflects detection confidence + appearance similarity (averaged over fused boxes)
 
 **Containment filter (`--final-containment-thresh`, default 0.85):**
 - Post-WBF: for each box pair, compute `intersection / min(area_i, area_j)`
@@ -368,7 +401,7 @@ Dataset: Ultralytics Construction-PPE ([docs](https://docs.ultralytics.com/datas
 
 ## 2026-06-21
 
-### ADDED — `test/debug_yoloe_sam2_dino.py` (YOLOe + SAM2 masked-crop refs + DINOv2 masked-patch scoring)
+### ADDED — `experiments/debug_yoloe_sam2_dino.py` (YOLOe + SAM2 masked-crop refs + DINOv2 masked-patch scoring)
 
 New 3-phase pipeline test script replacing `utils/debug_yoloe_dino.py`. Key evolution: SAM2 is now used for **reference crop refinement** (not proposal generation), and DINOv2 uses **masked patch pooling** instead of full-crop CLS embedding.
 
@@ -421,7 +454,7 @@ Saves figures to `output_results/` (no matplotlib `show()`). Allows side-by-side
 
 Tested `debug_yoloe.py` on an industrial dataset class 2 (large uniform-color region) with 50 query crops, conf>=0.06:
 - **YOLOe consistently proposes correct regions** across multiple source images
-- Proposals are well-localized on the black panel / car body area
+- Proposals are well-localized on the large object region
 - At conf>=0.15: fewer but accurate proposals. At conf>=0.06: more coverage, still correct.
 - Works on the exact object class that SAM2, SAM3, and OWLv2 all failed on.
 

@@ -22,7 +22,7 @@ DINOv2 embedding: masked patch pooling
     fallback to CLS if mask covers zero patch tokens
 
 Usage:
-    python test/debug_yoloe_sam2_dino.py \\
+    python experiments/debug_yoloe_sam2_dino.py \\
         --queries      "D:/path/to/crops/cls0" \\
         --targets-dir  "D:/path/to/target/images" \\
         --source-images "D:/path/to/source/frames" \\

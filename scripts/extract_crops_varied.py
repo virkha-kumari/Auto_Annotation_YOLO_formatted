@@ -12,7 +12,8 @@ Usage:
         --padding 0.05
 
 Each saved crop is named:
-    <frame_stem>_cls<class_id>_<ann_idx>.png
+    <frame_stem>_cls<class_id>_<line_idx>.png
+line_idx = raw line index in the label file, so downstream pipelines resolve the exact instance.
 """
 
 import argparse
@@ -84,13 +85,13 @@ def main():
             continue
 
         annotations = []
-        for line in label_path.read_text().splitlines():
+        for line_idx, line in enumerate(label_path.read_text().splitlines()):
             parts = line.strip().split()
             if len(parts) < 5:
                 continue
             cls_id = int(parts[0])
             if cls_id in target_classes:
-                annotations.append((cls_id, float(parts[1]), float(parts[2]),
+                annotations.append((line_idx, cls_id, float(parts[1]), float(parts[2]),
                                      float(parts[3]), float(parts[4])))
         if not annotations:
             continue
@@ -98,7 +99,7 @@ def main():
         img = Image.open(img_path).convert("RGB")
         iw, ih = img.size
 
-        for ann_idx, (cls_id, cx, cy, w, h) in enumerate(annotations):
+        for ann_idx, cls_id, cx, cy, w, h in annotations:
             x1, y1, x2, y2 = yolo_to_xyxy(cx, cy, w, h, iw, ih, args.padding)
             if x2 <= x1 or y2 <= y1:
                 skipped_zero += 1

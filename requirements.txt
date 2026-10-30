@@ -3,17 +3,18 @@
 torch==2.7.1
 torchvision==0.22.1
 torchaudio==2.7.1
-transformers>=4.40.0
+# Model-facing libs pinned to the tested versions (SAM3 classes need transformers 5.x)
+transformers==5.5.3
+ultralytics==8.4.37
+sam2==1.1.0
+ensemble-boxes==1.0.9
+gradio==6.19.0
+accelerate>=1.14.0
 Pillow>=10.0.0
 matplotlib>=3.8.0
 numpy>=1.24.0
-questionary>=2.0.0
-imagehash
+imagehash>=4.3.2
 scikit-learn>=1.4.0
-ultralytics
-sam2
-ensemble-boxes
-opencv-python
+opencv-python>=4.8.0
+psutil>=5.9.0
 tqdm
-gradio>=6.19.0
-accelerate

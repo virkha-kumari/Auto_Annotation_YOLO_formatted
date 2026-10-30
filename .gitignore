@@ -10,3 +10,4 @@ crop*/
 output*/
 data/
 *.pyc
+runs/

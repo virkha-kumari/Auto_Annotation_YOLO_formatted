@@ -9,8 +9,12 @@ All selected classes run in ONE pipeline pass:
   Phase 3 — DINOv2:  load once → proto bank per class → score proposals → unload
   Phase 4 — WBF + containment filter → merged YOLO .txt per target (all classes)
 
+Reference instances = exactly the crops in --queries-dirs. Crop names must be
+<stem>_cls<id>_<line_idx> where line_idx is the raw label-file line index
+(as written by scripts/extract_crops_labelled.py / extract_crops_varied.py).
+
 Usage:
-    python scripts/auto_annotate.py \\
+    python scripts/yoloe_sam2_dinov2_module.py \\
         --queries-dirs  "D:/crops/cls0"  "D:/crops/cls6" \\
         --class-ids     0  6 \\
         --targets-dir   "D:/unlabeled/images" \\
@@ -39,6 +43,7 @@ SAM2_MODEL_ID   = "facebook/sam2.1-hiera-base-plus"
 IMG_EXTS        = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 CROP_STEM_RE    = re.compile(r"^(.+)_cls(\d+)_(\d+)$")
 DINO_PATCH_GRID = 16
+DINO_INPUT      = 224   # square resize, no center crop — whole crop maps onto the 16×16 patch grid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,44 +62,51 @@ def resolve_source_image(crop_path: Path, source_dir: Path) -> Path | None:
     return None
 
 
-def resolve_class_bboxes_padded(
-    crop_path: Path,
-    labels_dir: Path,
-    src_img: Image.Image,
-    padding: float,
-) -> list[np.ndarray] | None:
+def crop_label_row(crop_path: Path, labels_dir: Path) -> tuple[float, float, float, float] | None:
+    """(cx, cy, w, h) of the exact label line the crop was cut from (crop name = <stem>_cls<id>_<line_idx>)."""
     m = CROP_STEM_RE.match(crop_path.stem)
     if not m:
         return None
-    src_stem, cls_id = m.group(1), int(m.group(2))
+    src_stem, cls_id, line_idx = m.group(1), int(m.group(2)), int(m.group(3))
     label_path = labels_dir / (src_stem + ".txt")
     if not label_path.exists():
         return None
-    iw, ih = src_img.size
+    lines = label_path.read_text().splitlines()
+    parts = lines[line_idx].split() if line_idx < len(lines) else []
+    if len(parts) < 5 or int(parts[0]) != cls_id:
+        print(f"[warn] {crop_path.name}: label line {line_idx} is not cls{cls_id} — "
+              f"re-extract crops (names must use raw label line index)")
+        return None
+    return float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+
+
+def rows_to_bboxes_px(
+    rows: list[tuple[float, float, float, float]],
+    img_size: tuple[int, int],
+    padding: float,
+) -> list[np.ndarray]:
+    iw, ih = img_size
     bboxes = []
-    for line in label_path.read_text().splitlines():
-        parts = line.strip().split()
-        if len(parts) < 5 or int(parts[0]) != cls_id:
-            continue
-        cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+    for cx, cy, w, h in rows:
         pad_x, pad_y = w * padding, h * padding
         x1 = max(0,      int((cx - w / 2 - pad_x) * iw))
         y1 = max(0,      int((cy - h / 2 - pad_y) * ih))
         x2 = min(iw - 1, int((cx + w / 2 + pad_x) * iw))
         y2 = min(ih - 1, int((cy + h / 2 + pad_y) * ih))
         bboxes.append(np.array([x1, y1, x2, y2], dtype=np.float32))
-    return bboxes if bboxes else None
+    return bboxes
 
 
 def make_masked_crop(img_np: np.ndarray, mask_hw: np.ndarray,
-                     bbox: np.ndarray) -> Image.Image:
+                     bbox: np.ndarray) -> tuple[Image.Image, np.ndarray]:
+    """Bbox crop with background zeroed + the crop-local bool mask (passed to DINOv2 explicitly)."""
     ih, iw = img_np.shape[:2]
     x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
     x2, y2 = min(iw, int(bbox[2])), min(ih, int(bbox[3]))
     crop = img_np[y1:y2, x1:x2].copy()
-    mask_crop = mask_hw[y1:y2, x1:x2]
-    crop[mask_crop == 0] = 0
-    return Image.fromarray(crop)
+    mask_crop = mask_hw[y1:y2, x1:x2] > 0
+    crop[~mask_crop] = 0
+    return Image.fromarray(crop), mask_crop
 
 
 def make_bbox_crop(img_np: np.ndarray, bbox: np.ndarray) -> Image.Image:
@@ -105,21 +117,14 @@ def make_bbox_crop(img_np: np.ndarray, bbox: np.ndarray) -> Image.Image:
     return Image.fromarray(img_np[y1:y2, x1:x2])
 
 
-def p90_bbox_area(labels_dir: Path, cls_id: int) -> float:
-    """90th-percentile bbox area (w*h normalised) for cls_id across all label files.
+def p90_area(areas: list[float]) -> float:
+    """90th-percentile bbox area (w*h normalised) of the selected ref instances.
     If p90 < --small-obj-thresh the class is small — even its largest typical instances
     are tiny, so SAM2 masking adds no signal."""
-    areas = []
-    for f in labels_dir.glob("*.txt"):
-        for line in f.read_text().splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 5 and int(parts[0]) == cls_id:
-                areas.append(float(parts[3]) * float(parts[4]))
     if not areas:
         return 1.0
-    areas.sort()
-    idx = int(len(areas) * 0.9)
-    return areas[min(idx, len(areas) - 1)]
+    areas = sorted(areas)
+    return areas[min(int(len(areas) * 0.9), len(areas) - 1)]
 
 
 def xyxy_to_yolo(box: list[float], iw: int, ih: int) -> tuple[float, float, float, float]:
@@ -135,54 +140,47 @@ def xyxy_to_yolo(box: list[float], iw: int, ih: int) -> tuple[float, float, floa
 # DINOv2 masked patch pooling
 # ─────────────────────────────────────────────────────────────────────────────
 
+def mask_to_patch_sel(mask: np.ndarray) -> np.ndarray:
+    """(256,) bool: patches >= 50% covered by the (non-empty) mask; if none, the most-covered patch(es)."""
+    cov = cv2.resize(mask.astype(np.float32), (DINO_PATCH_GRID, DINO_PATCH_GRID),
+                     interpolation=cv2.INTER_AREA).ravel()
+    sel = cov >= 0.5
+    return sel if sel.any() else cov >= cov.max()
+
+
 @torch.no_grad()
-def embed_masked_crops(
-    masked_crops: list[Image.Image],
+def embed_crops(
+    crops: list[Image.Image],
+    masks: list[np.ndarray | None],
     processor,
     model,
     device: str,
     batch_size: int = 32,
     desc: str = "embedding",
-    use_cls: bool = False,
 ) -> torch.Tensor:
     """
-    Embed crops with DINOv2.
-    use_cls=True  → mean of all tokens (CLS + patches) on raw bbox crop — for small objects
-    use_cls=False → masked patch pooling — mean of patch tokens inside SAM2 mask — for normal objects
+    Embed crops with DINOv2 (square resize, no center crop).
+    mask None  → mean of all tokens (CLS + patches) on raw bbox crop — small objects
+    mask given → masked patch pooling — mean of patch tokens covered by the crop-local mask
     """
     all_embs = []
-    for i in tqdm(range(0, len(masked_crops), batch_size),
+    for i in tqdm(range(0, len(crops), batch_size),
                   desc=f"  [dino] {desc}", unit="batch", leave=False):
-        batch  = masked_crops[i:i + batch_size]
-        inputs = processor(images=batch, return_tensors="pt").to(device)
-        out    = model(**inputs)
-        hs      = out.last_hidden_state
-        cls_tok = hs[:, 0, :]
+        batch       = crops[i:i + batch_size]
+        batch_masks = masks[i:i + batch_size]
+        inputs = processor(images=batch, return_tensors="pt", do_center_crop=False,
+                           size={"height": DINO_INPUT, "width": DINO_INPUT}).to(device)
+        hs         = model(**inputs).last_hidden_state
+        patch_toks = hs[:, 1:, :]
 
-        if use_cls:
-            # mean of all tokens (CLS + patches) — same as EDA script for bbox crops
-            mean_tok = hs.mean(dim=1)
-            batch_embs = [F.normalize(mean_tok[b:b+1], dim=-1) for b in range(len(batch))]
-        else:
-            patch_toks = hs[:, 1:, :]
-            batch_embs = []
-            for b in range(len(batch)):
-                crop_np = np.array(batch[b].convert("L"))
-                if crop_np.max() == 0:
-                    batch_embs.append(F.normalize(cls_tok[b:b+1], dim=-1))
-                    continue
-                mask_small = cv2.resize(
-                    (crop_np > 0).astype(np.uint8),
-                    (DINO_PATCH_GRID, DINO_PATCH_GRID),
-                    interpolation=cv2.INTER_NEAREST,
-                ).ravel()
-                patch_sel = patch_toks[b][mask_small.astype(bool)]
-                emb = F.normalize(
-                    cls_tok[b:b+1] if len(patch_sel) == 0
-                    else patch_sel.mean(dim=0, keepdim=True),
-                    dim=-1,
-                )
-                batch_embs.append(emb)
+        batch_embs = []
+        for b, mask in enumerate(batch_masks):
+            if mask is None:
+                emb = hs[b:b+1].mean(dim=1)
+            else:
+                sel = torch.from_numpy(mask_to_patch_sel(mask)).to(patch_toks.device)
+                emb = patch_toks[b][sel].mean(dim=0, keepdim=True)
+            batch_embs.append(F.normalize(emb, dim=-1))
 
         all_embs.append(torch.cat(batch_embs, dim=0).cpu())
 
@@ -194,9 +192,8 @@ def embed_masked_crops(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_phase1_yoloe(
-    class_source_groups: dict[int, dict[str, list[Path]]],
+    class_source_groups: dict[int, dict[str, list[tuple]]],
     src_path_map:        dict[str, Path],
-    labels_dir:          Path,
     target_paths:        list[Path],
     yoloe_model,
     yoloe_conf:          float,
@@ -207,7 +204,7 @@ def run_phase1_yoloe(
     """
     Outer loop = stems, inner loop = target batches.
     Per stem: get_vpe(refer_image) bakes VPE into model → plain predict(source=batch).
-    ~3x speedup vs per-target outer loop (confirmed by test_yoloe_batch.py: 2.91x).
+    ~3x speedup vs per-target outer loop (confirmed by experiments/test_yoloe_batch.py: 2.91x).
     Returns proposals_per_target: {target: [(box, yoloe_conf, cls_idx, src_stem), ...]}
     """
     import ultralytics
@@ -224,17 +221,15 @@ def run_phase1_yoloe(
         if stem not in src_path_map:
             continue
         src_path = src_path_map[stem]
-        src_img  = Image.open(src_path).convert("RGB")
+        with Image.open(src_path) as im:
+            img_size = im.size
         bboxes_out: list[list[float]] = []
         cls_out:    list[int]         = []
         for cls_idx, cls_id in idx_to_cls.items():
-            sg = class_source_groups.get(cls_id, {})
-            if stem not in sg:
+            rows = class_source_groups.get(cls_id, {}).get(stem)
+            if not rows:
                 continue
-            bboxes_px = resolve_class_bboxes_padded(sg[stem][0], labels_dir, src_img, mask_padding)
-            if not bboxes_px:
-                continue
-            for b in bboxes_px:
+            for b in rows_to_bboxes_px(rows, img_size, mask_padding):
                 bboxes_out.append(b.tolist())
                 cls_out.append(cls_idx)
         if bboxes_out:
@@ -322,36 +317,32 @@ def build_sam2_predictor(sam2_model_id: str, device: str):
 
 
 def run_phase2a_sam2_refs(
-    class_source_groups: dict[int, dict[str, list[Path]]],
+    class_source_groups: dict[int, dict[str, list[tuple]]],
     src_path_map:        dict[str, Path],
-    labels_dir:          Path,
     predictor,
     mask_padding:        float,
     sam_score_min:       float,
     sam_area_min:        float,
     small_cls:           set[int],
-) -> dict[int, tuple[list[Image.Image], list[str]]]:
-    """Build ref crops per class. Small classes skip SAM2 — raw bbox crop instead."""
+) -> dict[int, tuple[list[tuple[Image.Image, np.ndarray | None]], list[str]]]:
+    """Build ref crops per class. Small classes skip SAM2 — raw bbox crop instead (mask None)."""
     result: dict[int, tuple[list, list]] = {}
 
     for cls_id, source_groups in class_source_groups.items():
-        ref_crops: list[Image.Image] = []
-        ref_names: list[str]         = []
+        ref_crops: list[tuple[Image.Image, np.ndarray | None]] = []
+        ref_names: list[str] = []
         skipped = 0
         is_small = cls_id in small_cls
 
-        for stem, crops in tqdm(source_groups.items(),
-                                desc=f"[phase2a] cls{cls_id} refs", unit="frame", leave=False):
-            src_path  = src_path_map[stem]
-            src_img   = Image.open(src_path).convert("RGB")
+        for stem, rows in tqdm(source_groups.items(),
+                               desc=f"[phase2a] cls{cls_id} refs", unit="frame", leave=False):
+            src_img   = Image.open(src_path_map[stem]).convert("RGB")
             img_np    = np.array(src_img)
-            bboxes_px = resolve_class_bboxes_padded(crops[0], labels_dir, src_img, mask_padding)
-            if not bboxes_px:
-                continue
+            bboxes_px = rows_to_bboxes_px(rows, src_img.size, mask_padding)
 
             if is_small:
                 for bi, bbox in enumerate(bboxes_px):
-                    ref_crops.append(make_bbox_crop(img_np, bbox))
+                    ref_crops.append((make_bbox_crop(img_np, bbox), None))
                     ref_names.append(f"{stem}_inst{bi}")
             else:
                 predictor.set_image(img_np)
@@ -360,13 +351,14 @@ def run_phase2a_sam2_refs(
                     best      = int(np.argmax(scores))
                     mask      = raw_masks[best].astype(np.uint8)
                     sam_score = float(scores[best])
-                    if mask.sum() == 0:
-                        skipped += 1; continue
                     bbox_area  = max((bbox[2]-bbox[0]) * (bbox[3]-bbox[1]), 1.0)
                     area_ratio = float(mask.sum()) / bbox_area
                     if sam_score < sam_score_min or area_ratio < sam_area_min:
                         skipped += 1; continue
-                    ref_crops.append(make_masked_crop(img_np, mask, bbox))
+                    crop, mask_crop = make_masked_crop(img_np, mask, bbox)
+                    if not mask_crop.any():
+                        skipped += 1; continue
+                    ref_crops.append((crop, mask_crop))
                     ref_names.append(f"{stem}_inst{bi}")
 
         mode = "bbox-crop/mean-pool" if is_small else "sam2-masked-patch"
@@ -382,10 +374,10 @@ def run_phase2b_sam2_proposals(
     predictor,
     small_cls:  set[int],
     idx_to_cls: dict[int, int],
-) -> list[tuple[list[float], float, int, Image.Image, str]]:
+) -> list[tuple[list[float], float, int, tuple[Image.Image, np.ndarray | None], str]]:
     """
     Produce crops for all proposals.
-    Small-class proposals: raw bbox crop (no SAM2).
+    Small-class proposals: raw bbox crop (no SAM2, mask None).
     Normal proposals: batch through SAM2.
     """
     target_np = np.array(target_img)
@@ -397,7 +389,7 @@ def run_phase2b_sam2_proposals(
 
     # small objects — bbox crop, no SAM2
     for i, (box, conf, cls_idx, stem) in small_props:
-        result_map[i] = (box, conf, cls_idx, make_bbox_crop(target_np, np.array(box)), stem)
+        result_map[i] = (box, conf, cls_idx, (make_bbox_crop(target_np, np.array(box)), None), stem)
 
     # normal objects — SAM2 in chunks to avoid OOM on images with many proposals
     SAM2_BOX_CHUNK = 50
@@ -408,12 +400,15 @@ def run_phase2b_sam2_proposals(
             chunk = normal_props[chunk_start:chunk_start + SAM2_BOX_CHUNK]
             boxes_np = np.array([p[0] for _, p in chunk], dtype=np.float32)
             raw_masks, scores, _ = predictor.predict(box=boxes_np, multimask_output=True)
+            if raw_masks.ndim == 3:  # SAM2 squeezes the box dim when the chunk has a single box
+                raw_masks, scores = raw_masks[None], scores[None]
             for k, (i, (box, conf, cls_idx, stem)) in enumerate(chunk):
                 best_idx = int(np.argmax(scores[k]))
                 mask     = raw_masks[k, best_idx].astype(np.uint8)
-                if mask.sum() == 0:
+                crop, mask_crop = make_masked_crop(target_np, mask, np.array(box))
+                if not mask_crop.any():
                     skipped += 1; continue
-                result_map[i] = (box, conf, cls_idx, make_masked_crop(target_np, mask, np.array(box)), stem)
+                result_map[i] = (box, conf, cls_idx, (crop, mask_crop), stem)
         kept_normal = len(normal_props) - skipped
         print(f"[phase2b] normal: {kept_normal}/{len(normal_props)} kept | small: {len(small_props)} bbox-crop")
     else:
@@ -433,6 +428,8 @@ def run_wbf(
     nms_iou:    float,
     wbf_score:  float,
 ) -> tuple[list[list[float]], list[float]]:
+    """Single-model WBF (conf_type='avg'): fused score = mean combined score of the cluster.
+    No vote-count boost — one model means min(n_models, n_boxes) / n_models = 1."""
     from ensemble_boxes import weighted_boxes_fusion
     iw, ih = target_img.size
     if not kept:
@@ -535,7 +532,7 @@ def parse_args():
     p.add_argument("--sam-score-min",        type=float, default=0.50)
     p.add_argument("--sam-area-min",         type=float, default=0.10)
     p.add_argument("--small-obj-thresh",     type=float, default=0.01,
-                   help="Classes with p90 bbox area (w*h normalised) below this skip SAM2 "
+                   help="Classes whose ref crops have p90 bbox area (w*h normalised) below this skip SAM2 "
                         "and use mean-pool embedding on raw bbox crop instead of masked-patch pooling.")
     p.add_argument("--no-mask-classes",      nargs="+", type=int, default=[],
                    help="Class IDs to force into small-object handling (skip SAM2, mean-pool on raw "
@@ -570,33 +567,35 @@ def main():
         print("[abort] No images in targets-dir"); return
     print(f"[targets] {len(target_paths)} image(s)")
 
-    # Build per-class source groups
-    class_source_groups: dict[int, dict[str, list[Path]]] = {}
+    # Build per-class source groups: cls → stem → [(cx, cy, w, h)] of exactly the selected crops
+    labels_dir = Path(args.labels)
+    class_source_groups: dict[int, dict[str, list[tuple]]] = {}
     src_path_map: dict[str, Path] = {}
 
     for cls_id, queries_dir in zip(args.class_ids, args.queries_dirs):
         crop_paths = sorted(
             cp for cp in Path(queries_dir).iterdir() if cp.suffix.lower() in IMG_EXTS
         )
-        print(f"[crops] cls{cls_id}: {len(crop_paths)} reference crop(s)")
-        sg: dict[str, list[Path]] = {}
+        sg: dict[str, list[tuple]] = {}
         for cp in crop_paths:
             src = resolve_source_image(cp, Path(args.source_images))
-            if src is None:
+            row = crop_label_row(cp, labels_dir) if src else None
+            if row is None:
                 continue
-            sg.setdefault(src.stem, []).append(cp)
+            sg.setdefault(src.stem, []).append(row)
             src_path_map[src.stem] = src
         class_source_groups[cls_id] = sg
-        print(f"[sources] cls{cls_id}: {len(sg)} unique source frame(s)")
+        n_inst = sum(len(r) for r in sg.values())
+        print(f"[crops] cls{cls_id}: {len(crop_paths)} crop(s) → {n_inst} ref instance(s) "
+              f"from {len(sg)} source frame(s)")
 
     if not any(class_source_groups.values()):
         print("[abort] No source frames resolved"); return
 
-    # Detect small-object classes — skip SAM2, use CLS embedding
-    labels_dir_path = Path(args.labels)
+    # Detect small-object classes from the selected ref instances — skip SAM2, mean-pool embedding
     small_cls: set[int] = set()
     for cls_id in args.class_ids:
-        p90 = p90_bbox_area(labels_dir_path, cls_id)
+        p90 = p90_area([w * h for rows in class_source_groups[cls_id].values() for _, _, w, h in rows])
         mode = "bbox-crop/mean-pool" if p90 < args.small_obj_thresh else "SAM2/masked-patch"
         print(f"[cls{cls_id}] p90 bbox area={p90:.5f} → {mode}")
         if p90 < args.small_obj_thresh:
@@ -610,14 +609,16 @@ def main():
     idx_to_cls = {i: c for i, c in enumerate(class_ids)}
 
     t0 = time.time()
+    timing: dict[str, float] = {}
 
     # ── Phase 1: YOLOe ──────────────────────────────────────────────────────
+    t_phase = time.time()
     from ultralytics import YOLO
     print(f"\n[phase1] Loading YOLOe: {args.yoloe_model} ...")
     yoloe_model = YOLO(args.yoloe_model)
 
     proposals_per_target = run_phase1_yoloe(
-        class_source_groups, src_path_map, Path(args.labels),
+        class_source_groups, src_path_map,
         target_paths, yoloe_model,
         args.yoloe_conf, args.nms_iou, args.sam2_mask_padding,
         target_batch_size=args.yoloe_batch_size,
@@ -625,14 +626,16 @@ def main():
 
     del yoloe_model
     torch.cuda.empty_cache()
-    print(f"[phase1] Done ({time.time()-t0:.1f}s)")
+    timing["phase1_yoloe_s"] = time.time() - t_phase
+    print(f"[phase1] Done ({timing['phase1_yoloe_s']:.1f}s)")
 
     # ── Phase 2: SAM2 ───────────────────────────────────────────────────────
+    t_phase = time.time()
     print(f"\n[phase2] Loading SAM2: {args.sam2_model} ...")
     sam2_obj, predictor = build_sam2_predictor(args.sam2_model, device)
 
     ref_crops_by_cls = run_phase2a_sam2_refs(
-        class_source_groups, src_path_map, Path(args.labels),
+        class_source_groups, src_path_map,
         predictor, args.sam2_mask_padding,
         args.sam_score_min, args.sam_area_min,
         small_cls,
@@ -658,9 +661,11 @@ def main():
 
     del predictor, sam2_obj
     torch.cuda.empty_cache()
-    print(f"[phase2] Done ({time.time()-t0:.1f}s)")
+    timing["phase2_sam2_s"] = time.time() - t_phase
+    print(f"[phase2] Done ({timing['phase2_sam2_s']:.1f}s)")
 
     # ── Phase 3: DINOv2 ─────────────────────────────────────────────────────
+    t_phase = time.time()
     from transformers import AutoImageProcessor, AutoModel
     print(f"\n[phase3] Loading DINOv2: {DINOV2_MODEL_ID} ...")
     try:
@@ -675,10 +680,10 @@ def main():
     for cls_id, (ref_crops, ref_names) in ref_crops_by_cls.items():
         if not ref_crops:
             continue
-        bank = embed_masked_crops(ref_crops, processor, dino_model, device,
-                                  batch_size=args.dino_batch_size,
-                                  desc=f"cls{cls_id} proto bank",
-                                  use_cls=(cls_id in small_cls))
+        bank = embed_crops([c for c, _ in ref_crops], [m for _, m in ref_crops],
+                           processor, dino_model, device,
+                           batch_size=args.dino_batch_size,
+                           desc=f"cls{cls_id} proto bank")
         proto_banks[cls_id] = (bank, ref_names)
         print(f"[phase3] cls{cls_id} proto bank: {bank.shape}")
 
@@ -698,11 +703,10 @@ def main():
             if cls_id not in proto_banks:
                 continue
             bank, ref_names = proto_banks[cls_id]
-            prop_crops = [mc for _, _, mc, _ in props]
-            prop_embs  = embed_masked_crops(prop_crops, processor, dino_model, device,
-                                            batch_size=args.dino_batch_size,
-                                            desc=f"{target_path.name} cls{cls_id}",
-                                            use_cls=(cls_id in small_cls))
+            prop_embs  = embed_crops([mc[0] for _, _, mc, _ in props], [mc[1] for _, _, mc, _ in props],
+                                     processor, dino_model, device,
+                                     batch_size=args.dino_batch_size,
+                                     desc=f"{target_path.name} cls{cls_id}")
             sim_matrix           = prop_embs @ bank.T
             best_sims, best_idxs = sim_matrix.max(dim=1)
 
@@ -718,9 +722,11 @@ def main():
 
     del dino_model
     torch.cuda.empty_cache()
-    print(f"[phase3] Done ({time.time()-t0:.1f}s)")
+    timing["phase3_dinov2_s"] = time.time() - t_phase
+    print(f"[phase3] Done ({timing['phase3_dinov2_s']:.1f}s)")
 
     # ── Phase 4: WBF + containment + save ────────────────────────────────────
+    t_phase = time.time()
     summary = {}
     for target_path in target_paths:
         target_name = target_path.name
@@ -763,7 +769,14 @@ def main():
         }
 
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\n[done] All targets in {time.time()-t0:.1f}s → {output_dir.resolve()}")
+    timing["phase4_wbf_save_s"] = time.time() - t_phase
+    timing["total_s"] = time.time() - t0
+    timing["n_targets"] = len(target_paths)
+    (output_dir / "timing.json").write_text(json.dumps(
+        {k: round(v, 1) if isinstance(v, float) else v for k, v in timing.items()}, indent=2))
+    print("\n[timing] per phase (not cumulative): " +
+          "  ".join(f"{k}={v:.1f}" for k, v in timing.items() if k.endswith("_s")))
+    print(f"[done] All targets in {timing['total_s']:.1f}s → {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
