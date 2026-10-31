@@ -248,7 +248,7 @@ summary.json boxes — A: {xyxy, score}; B: {box, sam3_score, dino_sim, combined
 
 ## Collaboration
 
-Open to collaboration — if you have ideas on improving the proposal quality, the scoring stage, or the few-shot head direction above, feel free to reach out or open an issue.
+Open to collaboration — if you have ideas on improving the proposal quality, the scoring stage, feel free to reach out or open an issue.
 
 If you hit a bug, a dataset where the pipeline behaves unexpectedly, or have a suggestion to improve any part of the pipeline — don't hesitate to open an issue. Every edge case is useful signal.
 
