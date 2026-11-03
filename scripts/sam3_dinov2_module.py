@@ -37,6 +37,7 @@ import argparse
 import gc
 import json
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -66,6 +67,45 @@ SPLIT_RATIO = 0.5   # ref gets 50% of canvas, target gets 50%
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 DINO_PATCH_GRID = 16  # DINOv2-base patch grid for 224px input
 DINO_INPUT = 224      # square resize, no center crop — whole crop maps onto the 16×16 patch grid
+
+
+def warn_skip(where: str, e: Exception, log_path: Path) -> None:
+    """Warn + append traceback to errors.log; caller skips the batch. Non-OOM CUDA errors leave the
+    CUDA context unusable (every later batch would fail too) → re-raised instead."""
+    msg = f"[WARN] {where}: {type(e).__name__}: {e} — batch skipped"
+    print(msg)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(msg + "\n" + traceback.format_exc() + "\n")
+    if not isinstance(e, torch.cuda.OutOfMemoryError) and "CUDA" in str(e):
+        print(f"[ERROR] {where}: non-OOM CUDA error — aborting (see {log_path})")
+        raise e
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def auto_dino_batch_size(model, device: str, frac: float = 0.7, cap: int = 4096) -> int:
+    """Largest DINOv2 batch keeping total VRAM use under `frac` of the GPU: per-sample peak memory
+    measured from two probe batches, remaining budget filled. CPU → 32."""
+    if device != "cuda":
+        return 32
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    base = torch.cuda.memory_allocated()
+    peaks = {}
+    for n in (8, 32):
+        torch.cuda.reset_peak_memory_stats()
+        model(pixel_values=torch.zeros(n, 3, DINO_INPUT, DINO_INPUT, device=device))
+        peaks[n] = torch.cuda.max_memory_allocated() - base
+    per_sample = max((peaks[32] - peaks[8]) / 24, 1.0)
+    fixed = max(peaks[8] - 8 * per_sample, 0.0)
+    budget = min(frac * total - base, free - (1 - frac) * total) - fixed  # never eat others' VRAM
+    bs = int(max(budget, 0) // per_sample)
+    bs = max(8, min(cap, bs - bs % 8))
+    torch.cuda.empty_cache()
+    print(f"[dino] auto batch size {bs} (~{per_sample / 2**20:.1f} MiB/sample, "
+          f"{frac:.0%} of {total / 2**30:.1f} GiB)")
+    return bs
 
 
 def discover_class_ids(refs_labels: Path) -> list[int]:
@@ -267,6 +307,8 @@ def select_diverse_refs(ref_boxes_by_class: dict, max_refs: int, dino_proto_size
     except OSError:
         dproc = AutoImageProcessor.from_pretrained("facebook/dinov2-base", local_files_only=True)
         dmodel = AutoModel.from_pretrained("facebook/dinov2-base", local_files_only=True).to(device).eval()
+    if dinov2_batch_size <= 0:
+        dinov2_batch_size = auto_dino_batch_size(dmodel, device)
 
     sam3_groups_by_class = {}
     proto_instances_by_class = {}
@@ -278,7 +320,12 @@ def select_diverse_refs(ref_boxes_by_class: dict, max_refs: int, dino_proto_size
                 for i in tqdm(range(0, len(insts_with_idx), dinov2_batch_size),
                                desc=f"  cls{class_id} dinov2", unit="batch", leave=False):
                     batch = insts_with_idx[i:i + dinov2_batch_size]
-                    crops = [_load_crop(inst) for _, inst in batch]
+                    crops = []
+                    for _, inst in batch:  # shrink to the processor's short-edge-256 step at load, not full-res
+                        c = _load_crop(inst)
+                        s = 256 / max(min(c.size), 1)
+                        crops.append(c.resize((max(1, round(c.width * s)), max(1, round(c.height * s))),
+                                              Image.BICUBIC))
                     inputs = dproc(images=crops, return_tensors="pt").to(device)
                     out = dmodel(**inputs)
                     batch_embs = out.last_hidden_state[:, 0, :].float().cpu().numpy()
@@ -442,10 +489,13 @@ def crop_result_to_target(placements, masks_canvas, boxes_canvas, scores_canvas,
 
 def mask_ref_crops_sam3(proto_instances_by_class: dict, small_cls: set, model, processor, device: str,
                          output_dir: Path, threshold: float = 0.0, mask_threshold: float = 0.6,
-                         box_chunk: int = 8, min_match_containment: float = 0.25) -> dict:
+                         box_chunk: int = 8, min_match_containment: float = 0.25,
+                         log_path: Path = Path("errors.log")) -> int:
     """Box-prompt SAM3 per ref instance (own image, own box). Adds 'mask' (packed, box-local) in place;
     small classes and SAM3 misses get None. SAM3 output has no positional link to input box order
-    (fixed-size DETR decoder) -- each prompt box matched to best-containment output box, not zipped by index."""
+    (fixed-size DETR decoder) -- each prompt box matched to best-containment output box, not zipped by index.
+    Returns the number of skipped (failed) SAM3 chunks."""
+    n_skipped = 0
     if threshold <= 0.0:
         print(f"  [refs] warning: --threshold={threshold} keeps every SAM3 query regardless of "
               f"confidence, including detections nowhere near the ref instance -- relying entirely "
@@ -490,13 +540,13 @@ def mask_ref_crops_sam3(proto_instances_by_class: dict, small_cls: set, model, p
                     with torch.no_grad():
                         outputs = model(**inputs)
                 except Exception as e:
-                    print(f"  [refs] cls{class_id} {img_path.name}: {e} — skipping chunk, refs dropped from bank")
+                    del inputs
+                    warn_skip(f"SAM3 ref masking cls{class_id} {img_path.name} "
+                              f"({len(chunk)} ref(s) dropped from bank)", e, log_path)
                     for inst in chunk:
                         inst["mask"] = None
                     n_failed += len(chunk)
-                    del inputs
-                    if device == "cuda":
-                        torch.cuda.empty_cache()
+                    n_skipped += 1
                     continue
 
                 results = processor.post_process_instance_segmentation(
@@ -531,7 +581,7 @@ def mask_ref_crops_sam3(proto_instances_by_class: dict, small_cls: set, model, p
                 ram_guard()
 
         print(f"[refs] cls{class_id}: {n_masked} ref(s) masked, {n_failed} SAM3 miss(es) — dropped from proto bank")
-    return proto_instances_by_class
+    return n_skipped
 
 
 def box_iou(a, b):
@@ -687,32 +737,39 @@ def mask_to_patch_sel(mask: np.ndarray) -> np.ndarray:
     return sel if sel.any() else cov >= cov.max()
 
 
+def prep_dino(crop: Image.Image, mask: np.ndarray | None) -> tuple[Image.Image, np.ndarray | None]:
+    """Shrink to DINOv2 input before buffering: 224x224 crop (same BICUBIC square resize the processor
+    does) + (256,) patch selection instead of the full mask. Keeps a batch's RAM independent of image size."""
+    sel = None if mask is None else mask_to_patch_sel(mask)
+    return crop.resize((DINO_INPUT, DINO_INPUT), Image.BICUBIC), sel
+
+
 @torch.no_grad()
+def embed_batch(crops: list[Image.Image], sels: list[np.ndarray | None], processor, model,
+                device: str) -> torch.Tensor:
+    """One DINOv2 forward on prep_dino() outputs, L2-normalised, returned on CPU.
+    sel given -> masked-patch pooling. sel None (small class) -> mean of all tokens."""
+    inputs = processor(images=crops, return_tensors="pt", do_center_crop=False,
+                       size={"height": DINO_INPUT, "width": DINO_INPUT}).to(device)
+    hs = model(**inputs).last_hidden_state
+    patch_toks = hs[:, 1:, :]
+
+    batch_embs = []
+    for b, sel in enumerate(sels):
+        if sel is None:
+            emb = hs[b:b + 1].mean(dim=1)
+        else:
+            emb = patch_toks[b][torch.from_numpy(sel).to(patch_toks.device)].mean(dim=0, keepdim=True)
+        batch_embs.append(F.normalize(emb, dim=-1))
+    return torch.cat(batch_embs, dim=0).cpu()
+
+
 def embed_masked_crops(crops: list[Image.Image], masks: list[np.ndarray | None], processor, model,
                         device: str, batch_size: int = 32, desc: str = "embedding") -> torch.Tensor:
-    """DINOv2 embedding (square resize, no center crop), L2-normalised.
-    mask given (crop-local, non-empty) -> masked-patch pooling. mask None (small class) -> mean of all tokens."""
     all_embs = []
     for i in tqdm(range(0, len(crops), batch_size), desc=f"  [dino] {desc}", unit="batch", leave=False):
-        batch = crops[i:i + batch_size]
-        batch_masks = masks[i:i + batch_size]
-        inputs = processor(images=batch, return_tensors="pt", do_center_crop=False,
-                           size={"height": DINO_INPUT, "width": DINO_INPUT}).to(device)
-        out = model(**inputs)
-        hs = out.last_hidden_state
-        patch_toks = hs[:, 1:, :]
-
-        batch_embs = []
-        for b, mask in enumerate(batch_masks):
-            if mask is None:
-                emb = hs[b:b + 1].mean(dim=1)
-            else:
-                sel = torch.from_numpy(mask_to_patch_sel(mask)).to(patch_toks.device)
-                emb = patch_toks[b][sel].mean(dim=0, keepdim=True)
-            batch_embs.append(F.normalize(emb, dim=-1))
-
-        all_embs.append(torch.cat(batch_embs, dim=0).cpu())
-        del batch, inputs, out
+        prepped = [prep_dino(c, m) for c, m in zip(crops[i:i + batch_size], masks[i:i + batch_size])]
+        all_embs.append(embed_batch([c for c, _ in prepped], [s for _, s in prepped], processor, model, device))
         ram_guard()
     return torch.cat(all_embs, dim=0) if all_embs else torch.empty((0, model.config.hidden_size))
 
@@ -737,47 +794,48 @@ def build_proto_banks(proto_instances_by_class: dict, small_cls: set, dproc, dmo
 
 
 def score_dets_dinov2(dets_by_target: dict[Path, list[dict]], proto_banks: dict[int, torch.Tensor],
-                       small_cls: set, dproc, dmodel, device: str,
-                       dino_batch_size: int, desc_prefix: str = "") -> None:
+                       small_cls: set, dproc, dmodel, device: str, dino_batch_size: int) -> None:
     """Adds 'dino_sim' (max cosine sim vs proto_banks) and 'combined_score' (0.2*sam3_score +
     0.8*dino_sim) to each det in-place. Non-small classes use the det's own SAM3 mask (masked-patch
     pooling); small classes mean-pool the raw crop. None for degenerate boxes / empty masks /
-    classes without a bank -> routes to rejected. Targets decoded one at a time."""
-    with torch.no_grad():
+    classes without a bank -> routes to rejected. Crops streamed across targets into full batches
+    (only one batch of 224px crops in RAM); targets decoded one at a time."""
+    buf = []  # (det, 224px crop, patch sel)
+
+    def flush():
+        embs = embed_batch([b[1] for b in buf], [b[2] for b in buf], dproc, dmodel, device)
+        for (d, _, _), emb in zip(buf, embs):
+            sim = float((emb @ proto_banks[d["class_id"]].T).max())  # best-matching ref, same as Pipeline A
+            d["dino_sim"] = sim
+            d["combined_score"] = 0.2 * d["score"] + 0.8 * sim
+        buf.clear()
+        ram_guard()
+
+    n_total = sum(len(v) for v in dets_by_target.values())
+    with tqdm(total=n_total, desc="[dino] scoring proposals", unit="det") as pbar:
         for target_path, dets in dets_by_target.items():
             if not dets:
                 continue
             with Image.open(target_path) as img:
                 target_img = img.convert("RGB")
-            for class_id in sorted({d["class_id"] for d in dets}):
-                class_dets = [d for d in dets if d["class_id"] == class_id]
-                for d in class_dets:
-                    d["dino_sim"] = d["combined_score"] = None
-                if class_id not in proto_banks:
-                    continue
-                is_small = class_id in small_cls
-                valid_dets, crops, masks = [], [], []
-                for d in class_dets:
-                    x1, y1, x2, y2 = (int(v) for v in d["box"])
-                    if x2 <= x1 or y2 <= y1:
-                        continue  # degenerate box (zero area) — can't embed
-                    mask = None if is_small else unpack_mask(d["mask"])
-                    if mask is not None and not mask.any():
-                        continue  # SAM3 mask falls outside its own box — no foreground to pool
-                    valid_dets.append(d)
-                    crops.append(target_img.crop((x1, y1, x2, y2)))
-                    masks.append(mask)
-                if not crops:
-                    continue
-                prop_embs = embed_masked_crops(crops, masks, dproc, dmodel, device, dino_batch_size,
-                                            desc=f"{desc_prefix}{target_path.name} cls{class_id}")
-                sims, _ = (prop_embs @ proto_banks[class_id].T).max(dim=1)  # best-matching ref, same as Pipeline A
-                for d, sim in zip(valid_dets, sims.tolist()):
-                    d["dino_sim"] = float(sim)
-                    d["combined_score"] = 0.2 * d["score"] + 0.8 * float(sim)
             for d in dets:
-                d["mask"] = None  # no longer needed — free RAM before the next target
-            ram_guard()
+                pbar.update(1)
+                d["dino_sim"] = d["combined_score"] = None
+                packed, d["mask"] = d["mask"], None  # free RAM as dets are consumed
+                if d["class_id"] not in proto_banks:
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in d["box"])
+                if x2 <= x1 or y2 <= y1:
+                    continue  # degenerate box (zero area) — can't embed
+                mask = None if d["class_id"] in small_cls else unpack_mask(packed)
+                if mask is not None and not mask.any():
+                    continue  # SAM3 mask falls outside its own box — no foreground to pool
+                buf.append((d, *prep_dino(target_img.crop((x1, y1, x2, y2)), mask)))
+                if len(buf) >= dino_batch_size:
+                    flush()
+            del target_img
+        if buf:
+            flush()
 
 
 def write_yolo_txt(kept_dets: list[dict], img_w: int, img_h: int, output_path):
@@ -816,8 +874,8 @@ def parse_args():
     p.add_argument("--dino-proto-size", type=int, default=100,
                     help="Ref crops per class in the DINOv2 proto bank, farthest-point sampled (0 = use all). "
                          "Bigger than --max-refs-per-class — DINOv2 embedding is cheap, small pools are noisy.")
-    p.add_argument("--dinov2-batch-size", type=int, default=32,
-                    help="Crops per forward pass during diverse-ref DINOv2 embedding.")
+    p.add_argument("--dinov2-batch-size", type=int, default=0,
+                    help="DINOv2 crops per forward (ref selection + scoring). 0 = auto (fills ~70%% of GPU VRAM).")
     p.add_argument("--phash-max-dist", type=int, default=4,
                     help="Perceptual-hash dedup of ref crops before DINOv2 embedding "
                          "(hamming distance <= this = duplicate, skipped). 0 = disabled. ")
@@ -923,9 +981,11 @@ def main():
         model = Sam3Model.from_pretrained(SAM3_MODEL_ID, torch_dtype=dtype, device_map=device, local_files_only=True)
         processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID, local_files_only=True)
 
+    errors_log = output_dir / "errors.log"
     print("\n[refs] Masking ref crops with SAM3 (box-prompt) ...")
-    mask_ref_crops_sam3(proto_instances_by_class, small_cls, model, processor, device, output_dir,
-                         threshold=args.threshold, mask_threshold=args.mask_threshold)
+    n_skipped = mask_ref_crops_sam3(proto_instances_by_class, small_cls, model, processor, device, output_dir,
+                                    threshold=args.threshold, mask_threshold=args.mask_threshold,
+                                    log_path=errors_log)
 
     ref_pairs = [(class_id, gi, rg) for class_id, groups in ref_instances_by_class.items()
                  for gi, rg in enumerate(groups)]
@@ -981,11 +1041,11 @@ def main():
                 with torch.no_grad():
                     outputs = model(**inputs)
             except Exception as e:
-                print(f"  [class={class_id} ref_group={ref_group['names']}] "
-                      f"batch {batch_start // batch_size + 1}: {e} — skipping batch")
                 del inputs
-                if device == "cuda":
-                    torch.cuda.empty_cache()
+                warn_skip(f"SAM3 class={class_id} ref_group={group_idx} "
+                          f"batch {batch_start // batch_size + 1} ({len(batch_paths)} target(s))", e, errors_log)
+                n_skipped += 1
+                done += len(batch_paths)
                 continue
 
             results_list = processor.post_process_instance_segmentation(
@@ -1044,14 +1104,13 @@ def main():
     except OSError:
         dproc = AutoImageProcessor.from_pretrained(DINOV2_MODEL_ID, local_files_only=True)
         dmodel = AutoModel.from_pretrained(DINOV2_MODEL_ID, local_files_only=True).to(device).eval()
+    dino_bs = args.dinov2_batch_size if args.dinov2_batch_size > 0 else auto_dino_batch_size(dmodel, device)
 
-    dino_proto_banks = build_proto_banks(proto_instances_by_class, small_cls, dproc, dmodel, device,
-                                          args.dinov2_batch_size)
+    dino_proto_banks = build_proto_banks(proto_instances_by_class, small_cls, dproc, dmodel, device, dino_bs)
 
     # Gate on combined_score before voting/containment — runs first so a garbage oversized
     # SAM3 box gets killed on appearance before it can swallow real boxes via containment
-    score_dets_dinov2(dets_by_target, dino_proto_banks, small_cls, dproc, dmodel, device,
-                       args.dinov2_batch_size)
+    score_dets_dinov2(dets_by_target, dino_proto_banks, small_cls, dproc, dmodel, device, dino_bs)
 
     del dmodel, dproc
     if device == "cuda":
@@ -1111,11 +1170,14 @@ def main():
 
     timing["total_s"] = time.time() - t_start
     timing["n_targets"] = len(target_paths)
+    timing["skipped_batches"] = n_skipped
     (output_dir / "timing.json").write_text(json.dumps(
         {k: round(v, 1) if isinstance(v, float) else v for k, v in timing.items()}, indent=2))
     print(f"\n[done] Output -> {output_dir.resolve()}")
     print("[timing] per phase (not cumulative): " +
           "  ".join(f"{k}={v:.1f}" for k, v in timing.items() if k.endswith("_s")))
+    if n_skipped:
+        print(f"[WARN] {n_skipped} SAM3 batch(es) skipped — results incomplete, see {errors_log}")
 
 
 if __name__ == "__main__":

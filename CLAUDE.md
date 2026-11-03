@@ -147,6 +147,8 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - DINOv2 cosine similarity threshold (`--dino-thresh`): `0.65`
 - Small object threshold (`--small-obj-thresh`): `0.01` (p90 w×h normalised)
 - NMS IoU (`--nms-iou`): `0.45`
+- Cross-stem proposal dedup (`--yoloe-iou`): `0.90` (per class, before SAM2)
+- DINOv2 batch size (`--dino-batch-size`): `0` = auto (~70% of GPU VRAM)
 - WBF score gate (`--wbf-score`): `0.10`
 - Result threshold (`--result-thresh`): `0.50`
 - Containment filter (`--containment-thresh`): `0.70`
@@ -166,6 +168,7 @@ Use `del` + `torch.cuda.empty_cache()` — not just `.cpu()` or `.to("cpu")`.
 - SAM3 score threshold (`--threshold`): `0.6`
 - Max refs per class for SAM3 exemplars (`--max-refs-per-class`): `5`
 - DINOv2 proto bank size (`--dino-proto-size`): `100`
+- DINOv2 batch size (`--dinov2-batch-size`): `0` = auto (~70% of GPU VRAM)
 - Phash dedup distance (`--phash-max-dist`): `4`
 - Ref bbox padding (`--ref-box-padding`): `0.01` (fractional, clamped to image bounds)
 - Force no-mask classes (`--no-mask-classes`): none by default

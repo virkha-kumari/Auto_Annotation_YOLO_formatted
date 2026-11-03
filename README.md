@@ -1,6 +1,6 @@
 # Few-Shot Visual Auto-Annotation for Object Detection
 
-**Abstract.** Labelling detection datasets is the main cost of deploying object detectors in industrial settings. This project studies how far *purely visual* few-shot prompting (no text prompts, no training) can go in auto-annotating unlabelled images from *k* labelled instances per class. Two training-free pipelines built from frozen foundation models are compared: **(A)** YOLOe visual-prompt proposals → SAM2 masks → DINOv2 masked-patch verification → box fusion, and **(B)** SAM3 cross-image exemplar prompting via canvas compositing → DINOv2 verification → cross-exemplar voting. Both output YOLO-format labels and run on a single consumer GPU (8 GB VRAM) by loading one model at a time. Evaluation is on the Construction-PPE dataset (11 classes) with *k* ∈ {15, 30, 50, 100} labelled instances per class on a fixed held-out split.
+**Abstract.** Labelling detection datasets is the main cost of deploying object detectors in industrial settings. This project studies how far *purely visual* few-shot prompting (no text prompts, no training) can go in auto-annotating unlabelled images from *k* labelled instances per class. Two training-free pipelines built from frozen foundation models are compared: **(A)** YOLOe visual-prompt proposals → SAM2 masks → DINOv2 masked-patch verification → box fusion, and **(B)** SAM3 cross-image exemplar prompting via canvas compositing → DINOv2 verification → cross-exemplar voting. Both output YOLO-format labels and run on a single consumer GPU (8 GB VRAM) by loading one model at a time. Evaluation is on the Construction-PPE dataset (11 classes) with *k* ∈ {15, 20, 25, 30, 35, 40, 45, 50} labelled instances per class on a fixed held-out split.
 
 ---
 
@@ -70,7 +70,7 @@ Phase 4 Vote   duplicates (IoU ≥ --dup-iou-thresh) merged; votes = #ref groups
 | Dataset | [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics), 1,416 images, 11 classes: helmet, gloves, vest, boots, goggles, none, Person, no_helmet, no_goggle, no_gloves, no_boots |
 | Labelled pool | `data/label/`: 1,266 images. References are drawn **only** from here |
 | Test split | `data/test/`: 150 images, stratified (≥ 15 images per class, rarest first), held out from the pool. Never used as references |
-| Shots | *k* ∈ {15, 30, 50, 100} labelled instances per class (capped by availability for rare classes, e.g. `no_boots`) |
+| Shots | *k* ∈ {15, 20, 25, 30, 35, 40, 45, 50} labelled instances per class (capped by availability for rare classes, e.g. `no_boots`) |
 | Reference selection | Same pool and same phash dedup (distance 4) for both pipelines. A: DBSCAN cluster medoids + farthest-point outliers; B: farthest-point sampling |
 | Metrics | Per-class P/R/F1 @ IoU 0.50; AP@.50 (101-point); mAP@.50:.95 (COCO, 10 IoU thresholds). Classes with GT but no predictions count as AP = 0; classes with 0 GT are excluded. Predictions ranked by pipeline score (A: fused score, B: final voted score) |
 | Timing | Per-phase wall-clock (`timing.json`, not cumulative) |
@@ -83,7 +83,7 @@ Thresholds were calibrated during development on Construction-PPE (history in [d
 
 ## 5. Results
 
-Pending. To be filled from `runs/kshot/summary.md` after the 8 runs (2 pipelines × 4 values of *k*): mAP@.50, mAP@.50:.95, and per-phase time per run, plus per-class AP@.50.
+Pending. To be filled from `runs/kshot/summary.md` after the 16 runs (2 pipelines × 8 values of *k*): mAP@.50, mAP@.50:.95, and per-phase time per run, plus per-class AP@.50.
 
 ---
 
@@ -121,6 +121,8 @@ Condensed; full chronology with dates and reasons in [docs/log.md](docs/log.md).
 
 ## 8. Future work
 
+- Multi-label YOLOe: one pass per class with visual-prompt embeddings from all reference frames stacked, instead of one pass per reference frame — fewer passes, no cross-class suppression.
+- Frozen YOLO11-L backbone with a few-shot head (ProtoNet-style or regularized linear) on ROI-pooled P3/P4/P5 features, trained on the *k* labelled crops, as a replacement for YOLOe's visual-prompt embedding — which reduces each class to one mean-pooled vector with no learned decision boundary.
 - Negative exemplars (SAM3 supports positive/negative box labels) for look-alike and absence classes.
 - Aspect-preserving (letterboxed) canvas composition for Pipeline B.
 - Per-class thresholds and learned score weights from the labelled pool, using a validation split separate from the test split.
@@ -147,7 +149,7 @@ SAM3 (`facebook/sam3`) is a gated model: accept its licence on Hugging Face and 
 ### k-shot sweep (both pipelines)
 
 ```bash
-bash experiments/run_kshot.sh          # writes runs/kshot/{A,B}_k{15,30,50,100}/ + summary.md
+bash experiments/run_kshot.sh          # writes runs/kshot/{A,B}_k{15,20,...,50}/ + summary.md
 # overrides via env, e.g.:  KS="15 30" B_ARGS="--no-preview --batch-size 8" bash experiments/run_kshot.sh
 ```
 
@@ -181,9 +183,10 @@ python scripts/eval_map.py --preds out_A --gt data/test --images data/test \
 |---|---|---|
 | `--yoloe-conf` | 0.06 | Min YOLOe confidence |
 | `--nms-iou` | 0.45 | YOLOe NMS IoU; also the WBF IoU |
+| `--yoloe-iou` | 0.90 | Cross-ref proposal dedup per class before SAM2 (1 = off) |
 | `--yoloe-batch-size` | 8 | Targets per predict call after VPE bake |
 | `--dino-thresh` | 0.65 | Min DINOv2 max-similarity |
-| `--dino-batch-size` | 32 | |
+| `--dino-batch-size` | 0 | 0 = auto (~70% of GPU VRAM) |
 | `--small-obj-thresh` | 0.01 | p90 normalised area of selected refs below this → no masking |
 | `--no-mask-classes` | — | Force class ids into no-mask routing |
 | `--sam2-mask-padding` | 0.05 | Ref box padding before prompting |
@@ -199,6 +202,7 @@ python scripts/eval_map.py --preds out_A --gt data/test --images data/test \
 |---|---|---|
 | `--dino-proto-size` | 100 | *k*: refs per class in the DINOv2 bank |
 | `--max-refs-per-class` | 5 | SAM3 exemplars (first N of the bank) |
+| `--dinov2-batch-size` | 0 | 0 = auto (~70% of GPU VRAM) |
 | `--threshold` / `--mask-threshold` | 0.6 / 0.6 | SAM3 score / mask binarisation |
 | `--sam3-dino-thresh` | 0.2 | Gate on `0.2·sam3 + 0.8·dino_sim` |
 | `--dup-iou-thresh` | 0.85 | IoU at which boxes are the same object (merged, voted) |

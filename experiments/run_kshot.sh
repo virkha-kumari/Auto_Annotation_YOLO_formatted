@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# k-shot sweep: k labelled instances/class (default 15 30 50 100), Pipeline A and B,
+# k-shot sweep: k labelled instances/class (default 15..50 step 5), Pipeline A and B,
 # same labelled pool, same held-out test split → metrics.json + timing.json per run.
 # Override any variable via env, e.g.  KS="15 30" B_ARGS="--batch-size 8" bash experiments/run_kshot.sh
 set -euo pipefail
@@ -8,13 +8,13 @@ cd "$(dirname "$0")/.."
 POOL=${POOL:-data/label}   # labelled pool (images + YOLO .txt, flat) — refs / seed crops come only from here
 TEST=${TEST:-data/test}    # held-out eval split (images + YOLO .txt, flat) — never used as refs
 OUT=${OUT:-runs/kshot}
-KS=${KS:-"15 30 50 100"}
+KS=${KS:-"15 20 25 30 35 40 45 50"}
 CLASS_IDS=${CLASS_IDS:-"0 1 2 3 4 5 6 7 8 9 10"}
 CLASS_NAMES=${CLASS_NAMES:-"helmet gloves vest boots goggles none Person no_helmet no_goggle no_gloves no_boots"}
 PHASH=${PHASH:-4}          # same near-duplicate dedup distance for both pipelines
 PY=${PY:-python}
-A_ARGS=${A_ARGS:-"--no-preview --yoloe-batch-size 16 --dino-batch-size 64"}
-B_ARGS=${B_ARGS:-"--no-preview --batch-size 16 --dinov2-batch-size 64"}
+A_ARGS=${A_ARGS:-"--no-preview --yoloe-batch-size 16"}   # DINOv2 batch: auto (~70% VRAM)
+B_ARGS=${B_ARGS:-"--no-preview --batch-size 16"}
 
 mkdir -p "$OUT"
 

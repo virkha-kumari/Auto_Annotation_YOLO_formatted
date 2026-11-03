@@ -7,6 +7,26 @@ Format:
 
 ---
 
+## 2026-11-03
+
+### FINDING — k-shot run crashed (GPU fell off bus) during Pipeline A
+
+Xid-level event (PCIe/power/driver) — root cause unconfirmed, user code can't drop the bus directly. Pipeline A workload was bursty (tiny per-target DINOv2 batches, CPU gaps) and RAM grew with stems × targets × proposals — every proposal crop + mask held in RAM until phase 3.
+
+### FIXED — Pipeline A RAM
+
+- No crops in RAM. Refs = box + packed box-local mask; proposal masks packed and pickled per target to `<output>/_mask_cache/` (deleted after phase 3). Crops re-cut from images in phase 3.
+
+### ADDED — both pipelines
+
+- `--yoloe-iou` (Pipeline A, default 0.90): per-class cross-stem NMS on YOLOe proposals before SAM2 — every stem re-detects the same objects. In app.py.
+- DINOv2 batch size `0 = auto` (default, both pipelines + app.py): two probe batches measure per-sample VRAM, batch fills ~70% of total VRAM.
+- DINOv2 scoring streamed across targets in full batches (was per target per class, often 2–5 crops); only one batch of crops in RAM.
+- Skipped batches (YOLOe predict, SAM3 forward/ref masking): `[WARN]` + traceback to `<output>/errors.log`, count in `timing.json` (`skipped_batches`). OOM → skip; other CUDA errors → abort (context unusable).
+- k-shot sweep: k ∈ {15, 20, …, 50}.
+
+---
+
 ## 2026-10-30
 
 ### FINDING — eval inflated mAP; README timing misread

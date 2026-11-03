@@ -186,7 +186,7 @@ def run_pipeline(
     dino_thresh, result_panel3_thresh, final_containment_thresh,
     sam2_mask_padding, sam_score_min, sam_area_min,
     dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir,
-    no_mask_classes, no_preview,
+    no_mask_classes, no_preview, yoloe_iou,
 ):
     if not targets_dir or not Path(targets_dir).is_dir():
         yield "❌ Targets dir not found.", gr.update(interactive=False), []
@@ -245,6 +245,7 @@ def run_pipeline(
         "--output-dir",         out_dir,
         "--yoloe-conf",         str(yoloe_conf),
         "--nms-iou",            str(nms_iou),
+        "--yoloe-iou",          str(yoloe_iou),
         "--wbf-score",          str(wbf_score),
         "--dino-thresh",        str(dino_thresh),
         "--result-thresh",      str(result_panel3_thresh),
@@ -252,7 +253,7 @@ def run_pipeline(
         "--sam2-mask-padding",  str(sam2_mask_padding),
         "--sam-score-min",      str(sam_score_min),
         "--sam-area-min",       str(sam_area_min),
-        "--dino-batch-size",    str(dino_batch_size),
+        "--dino-batch-size",    str(int(dino_batch_size)),
         "--yoloe-batch-size",   str(int(yoloe_batch_size)),
         "--small-obj-thresh",   str(small_obj_thresh),
     ]
@@ -662,6 +663,9 @@ def build_app():
                 nms_iou = gr.Number(value=0.45, precision=3,
                     label="NMS IoU",
                     info="Higher = fewer merges.")
+                yoloe_iou = gr.Number(value=0.90, precision=3,
+                    label="YOLOe dedup IoU",
+                    info="Cross-ref duplicate merge before SAM2. 1 = off.")
                 yoloe_batch_size = gr.Number(value=8, precision=0,
                     label="YOLOe target batch size",
                     info="Higher = faster, more VRAM.")
@@ -671,9 +675,9 @@ def build_app():
                 dino_thresh = gr.Number(value=0.65, precision=3,
                     label="DINOv2 similarity threshold",
                     info="Min cosine sim to keep proposal.")
-                dino_batch_size = gr.Number(value=32, precision=0,
+                dino_batch_size = gr.Number(value=0, precision=0,
                     label="DINOv2 batch size",
-                    info="Reduce if VRAM OOM.")
+                    info="0 = auto (~70% VRAM).")
                 small_obj_thresh = gr.Number(value=0.02, precision=4,
                     label="Small object threshold",
                     info="p90 bbox area below -> CLS embed.")
@@ -802,9 +806,9 @@ def build_app():
                 dino_proto_size_p2b = gr.Number(value=100, precision=0,
                     label="DINOv2 proto bank size",
                     info="Ref crops/class, FPS-sampled. 0=all.")
-                dinov2_batch_size_p2b = gr.Number(value=32, precision=0,
+                dinov2_batch_size_p2b = gr.Number(value=0, precision=0,
                     label="DINOv2 batch size",
-                    info="Ref embed + target scoring.")
+                    info="0 = auto (~70% VRAM).")
                 phash_max_dist_p2b = gr.Slider(0, 20, value=4, step=1,
                     label="Phash max dist",
                     info="Ref dedup dist. 0=off.")
@@ -978,7 +982,7 @@ def build_app():
                 dino_thresh, result_panel3_thresh, final_containment_thresh,
                 sam2_mask_padding, sam_score_min, sam_area_min,
                 dino_batch_size, yoloe_batch_size, small_obj_thresh, output_dir_p2,
-                no_mask_classes_p2, no_preview_p2,
+                no_mask_classes_p2, no_preview_p2, yoloe_iou,
             ],
             outputs=[pipeline_log, next_to_p3, result_images_state],
         )
