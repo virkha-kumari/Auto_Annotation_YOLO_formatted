@@ -1,7 +1,8 @@
 """
-Rebuild the Construction-PPE eval layout from the public Ultralytics zip:
-all images + YOLO labels flattened into <out>/label, then the 150 stems listed in
-experiments/ppe_test_split.txt moved to <out>/test (same split as the reported runs).
+Rebuild the Construction-PPE eval layout from the public Ultralytics zip (2026-11-03 release:
+800 train / 200 val, 12 classes). Official split, flattened:
+images/train + labels/train → <out>/label (labelled pool), images/val + labels/val → <out>/test.
+Also writes <out>/classes.txt (one name per line, from the zip's yaml) and copies the yaml.
 
 Usage:
     curl -L -o construction-ppe.zip https://github.com/ultralytics/assets/releases/download/v0.0.0/construction-ppe.zip
@@ -14,51 +15,50 @@ import shutil
 import sys
 from pathlib import Path
 
+import yaml
+
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
+SPLITS = {"train": "label", "val": "test"}  # zip split → output folder
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--src", required=True, help="Extracted zip root (searched recursively)")
     p.add_argument("--out", default="data")
-    p.add_argument("--split", default=str(Path(__file__).resolve().parent.parent / "experiments" / "ppe_test_split.txt"))
     args = p.parse_args()
 
     src, out = Path(args.src), Path(args.out)
-    label_dir, test_dir = out / "label", out / "test"
-    for d in (label_dir, test_dir):
-        if d.exists() and any(d.iterdir()):
-            sys.exit(f"[abort] {d} is not empty")
-        d.mkdir(parents=True, exist_ok=True)
+    for d in SPLITS.values():
+        if (out / d).exists() and any((out / d).iterdir()):
+            sys.exit(f"[abort] {out / d} is not empty")
+        (out / d).mkdir(parents=True, exist_ok=True)
 
-    images: dict[str, Path] = {}
-    for img in src.rglob("*"):
-        if img.suffix.lower() not in IMG_EXTS:
-            continue
-        if img.stem in images:
-            sys.exit(f"[abort] duplicate image stem {img.stem}: {images[img.stem]} vs {img}")
-        images[img.stem] = img
-    labels = {t.stem: t for t in src.rglob("*.txt") if "labels" in t.parts}
-    print(f"[scan] {len(images)} image(s), {len(labels)} label file(s)")
+    yamls = list(src.rglob("*.yaml"))
+    if len(yamls) != 1:
+        sys.exit(f"[abort] expected one dataset yaml, found {len(yamls)}")
+    names = yaml.safe_load(yamls[0].read_text())["names"]
+    (out / "classes.txt").write_text("\n".join(names[i] for i in sorted(names)) + "\n")
+    shutil.copy2(yamls[0], out / "data.yaml")
 
-    test_names = [l.strip() for l in Path(args.split).read_text().splitlines() if l.strip()]
-    test_stems = {Path(n).stem for n in test_names}
-    missing = test_stems - images.keys()
-    if missing:
-        sys.exit(f"[abort] {len(missing)} test image(s) not in zip, e.g. {sorted(missing)[:5]}")
-
-    n_label = n_test = n_nolabel = 0
-    for stem, img in sorted(images.items()):
-        dst = test_dir if stem in test_stems else label_dir
-        shutil.copy2(img, dst / img.name)
-        if stem in labels:
-            shutil.copy2(labels[stem], dst / f"{stem}.txt")
-        else:
-            n_nolabel += 1
-        n_test += dst is test_dir
-        n_label += dst is label_dir
-
-    print(f"[done] pool {n_label} → {label_dir}, test {n_test} → {test_dir}, {n_nolabel} image(s) without label")
+    seen: set[str] = set()
+    for split, dst_name in SPLITS.items():
+        dst = out / dst_name
+        n_img = n_nolabel = 0
+        for img in sorted(src.rglob(f"images/{split}/*")):
+            if img.suffix.lower() not in IMG_EXTS:
+                continue
+            if img.stem in seen:
+                sys.exit(f"[abort] duplicate image stem across splits: {img.stem}")
+            seen.add(img.stem)
+            shutil.copy2(img, dst / img.name)
+            label = img.parent.parent.parent / "labels" / split / f"{img.stem}.txt"
+            if label.exists():
+                shutil.copy2(label, dst / label.name)
+            else:
+                n_nolabel += 1
+            n_img += 1
+        print(f"[done] {split}: {n_img} image(s) → {dst} ({n_nolabel} without label)")
+    print(f"[classes] {len(names)}: {' '.join(names[i] for i in sorted(names))}")
 
 
 if __name__ == "__main__":

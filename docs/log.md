@@ -9,6 +9,14 @@ Format:
 
 ## 2026-11-03
 
+### FINDING — Construction-PPE zip replaced upstream
+
+Same URL now serves a new release (asset modified 2026-11-03, 647 MB): 800 train / 200 val, no test split, 12 classes — `none` removed, `Person` 6→5, `forklift` + `no_vest` added. Old release (1,416 images, 11 classes) no longer downloadable; all earlier numbers in this log are on the old release and not comparable.
+
+### DROPPED — custom 150-image test split (`experiments/ppe_test_split.txt`)
+
+Stems don't exist in the new release. Eval now uses the official split: train → `data/label/` (pool), val → `data/test/`. `prepare_ppe.py` rewritten for it (also writes `classes.txt`); `run_kshot.sh` class ids/names → 12 classes.
+
 ### FINDING — k-shot run crashed (GPU fell off bus) during Pipeline A
 
 Xid-level event (PCIe/power/driver) — root cause unconfirmed, user code can't drop the bus directly. Pipeline A workload was bursty (tiny per-target DINOv2 batches, CPU gaps) and RAM grew with stems × targets × proposals — every proposal crop + mask held in RAM until phase 3.

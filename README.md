@@ -1,6 +1,6 @@
 # Few-Shot Visual Auto-Annotation for Object Detection
 
-**Abstract.** Labelling detection datasets is the main cost of deploying object detectors in industrial settings. This project studies how far *purely visual* few-shot prompting (no text prompts, no training) can go in auto-annotating unlabelled images from *k* labelled instances per class. Two training-free pipelines built from frozen foundation models are compared: **(A)** YOLOe visual-prompt proposals → SAM2 masks → DINOv2 masked-patch verification → box fusion, and **(B)** SAM3 cross-image exemplar prompting via canvas compositing → DINOv2 verification → cross-exemplar voting. Both output YOLO-format labels and run on a single consumer GPU (8 GB VRAM) by loading one model at a time. Evaluation is on the Construction-PPE dataset (11 classes) with *k* ∈ {15, 20, 25, 30, 35, 40, 45, 50} labelled instances per class on a fixed held-out split.
+**Abstract.** Labelling detection datasets is the main cost of deploying object detectors in industrial settings. This project studies how far *purely visual* few-shot prompting (no text prompts, no training) can go in auto-annotating unlabelled images from *k* labelled instances per class. Two training-free pipelines built from frozen foundation models are compared: **(A)** YOLOe visual-prompt proposals → SAM2 masks → DINOv2 masked-patch verification → box fusion, and **(B)** SAM3 cross-image exemplar prompting via canvas compositing → DINOv2 verification → cross-exemplar voting. Both output YOLO-format labels and run on a single consumer GPU (8 GB VRAM) by loading one model at a time. Evaluation is on the Construction-PPE dataset (12 classes) with *k* ∈ {15, 20, 25, 30, 35, 40, 45, 50} labelled instances per class on a fixed held-out split.
 
 ---
 
@@ -67,14 +67,14 @@ Phase 4 Vote   duplicates (IoU ≥ --dup-iou-thresh) merged; votes = #ref groups
 
 | Item | Setting |
 |---|---|
-| Dataset | [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics), 1,416 images, 11 classes: helmet, gloves, vest, boots, goggles, none, Person, no_helmet, no_goggle, no_gloves, no_boots |
-| Labelled pool | `data/label/`: 1,266 images. References are drawn **only** from here |
-| Test split | `data/test/`: 150 images, stratified (≥ 15 images per class, rarest first), held out from the pool. Never used as references |
+| Dataset | [Construction-PPE](https://docs.ultralytics.com/datasets/detect/construction-ppe/) (Ultralytics, 2026-11-03 release), 1,000 images, 12 classes: helmet, gloves, vest, boots, goggles, Person, no_helmet, no_goggle, no_gloves, no_boots, forklift, no_vest. Built with [scripts/prepare_ppe.py](scripts/prepare_ppe.py) |
+| Labelled pool | `data/label/`: official train split, 800 images. References are drawn **only** from here |
+| Test split | `data/test/`: official val split, 200 images. Never used as references |
 | Shots | *k* ∈ {15, 20, 25, 30, 35, 40, 45, 50} labelled instances per class (capped by availability for rare classes, e.g. `no_boots`) |
 | Reference selection | Same pool and same phash dedup (distance 4) for both pipelines. A: DBSCAN cluster medoids + farthest-point outliers; B: farthest-point sampling |
 | Metrics | Per-class P/R/F1 @ IoU 0.50; AP@.50 (101-point); mAP@.50:.95 (COCO, 10 IoU thresholds). Classes with GT but no predictions count as AP = 0; classes with 0 GT are excluded. Predictions ranked by pipeline score (A: fused score, B: final voted score) |
 | Timing | Per-phase wall-clock (`timing.json`, not cumulative) |
-| Hardware | Development: RTX 4060 Laptop 8 GB. k-shot sweep: 24 GB GPU |
+| Hardware | Development: RTX 4060 Laptop 8 GB. k-shot sweep: RTX A4000 16 GB |
 | Script | [experiments/run_kshot.sh](experiments/run_kshot.sh) → [experiments/summarize_kshot.py](experiments/summarize_kshot.py) |
 
 Thresholds were calibrated during development on Construction-PPE (history in [docs/log.md](docs/log.md)) and are held fixed across all *k*.
@@ -116,7 +116,7 @@ Condensed; full chronology with dates and reasons in [docs/log.md](docs/log.md).
 - **Single dataset.** Thresholds were calibrated on Construction-PPE; transfer to other domains is untested.
 - **Score weights are empirical** (A: 0.3/0.7; B: 0.2/0.8) and not learned.
 - **Canvas aspect ratio.** Pipeline B resizes reference and target to 1008×504 each regardless of aspect ratio, which distorts shapes and halves the target's vertical resolution. This likely hurts small objects.
-- **Absence classes** (`none`, `no_*`) are structurally unsuited to exemplar matching: they are defined by a missing feature, so there is no coherent visual prototype to match.
+- **Absence classes** (`no_*`) are structurally unsuited to exemplar matching: they are defined by a missing feature, so there is no coherent visual prototype to match.
 - **Scaling.** Pipeline A's YOLOe phase costs `reference frames × ⌈targets / batch⌉` predict calls, so it grows with both the seed set and the target set. Pipeline B's SAM3 phase costs `ref groups × ⌈targets / batch⌉` forward passes. Both containment filters are O(n²) per class per image.
 
 ## 8. Future work
@@ -144,7 +144,12 @@ SAM3 (`facebook/sam3`) is a gated model: accept its licence on Hugging Face and 
 
 ### Data layout
 
-`data/label/` and `data/test/`: flat folders of images plus same-stem YOLO `.txt` labels.
+`data/label/` and `data/test/`: flat folders of images plus same-stem YOLO `.txt` labels. Construction-PPE:
+
+```bash
+curl -L -o construction-ppe.zip https://github.com/ultralytics/assets/releases/download/v0.0.0/construction-ppe.zip
+unzip -q construction-ppe.zip -d ppe_raw && python scripts/prepare_ppe.py --src ppe_raw --out data
+```
 
 ### k-shot sweep (both pipelines)
 
