@@ -15,6 +15,7 @@ Used across multiple industrial computer vision projects.
 | `README.md` | Full project overview, ablation, quick start, parameters |
 | `docs/plans.md` | What to do next — forward-looking only |
 | `docs/log.md` | Chronological log — ADDED features, DROPPED approaches, FINDINGS with reasons |
+| `docs/ablation.md` + `docs/results/` | A vs B ablation (k-shot, SAM3 exemplars), per-class tables, raw evidence |
 
 **Always update `docs/log.md`** when:
 - A new script or capability is added → `ADDED`
@@ -63,7 +64,7 @@ Used across multiple industrial computer vision projects.
 | `experiments/debug_yoloe.py` | Pure YOLOe visual-prompt debug | Reference |
 | `experiments/debug_yoloe_dinov2.py` | YOLOe+DINOv2, 3-panel viz, no SAM2 (predates `debug_yoloe_sam2_dino.py`) | Reference |
 | `experiments/test_owlv2_dinov2.py` | OWLv2+DINOv2 — dead end | Dead end |
-| `experiments/run_kshot.sh` | k-shot sweep (k=15/30/50/100), A + B, eval → `runs/kshot/` | Active |
+| `experiments/run_kshot.sh` | k-shot sweep (k=15..50 step 5), A + B, eval → `runs/kshot/` | Active |
 | `experiments/summarize_kshot.py` | k-shot runs → markdown tables for README | Active |
 
 ---
@@ -85,7 +86,7 @@ Used across multiple industrial computer vision projects.
 | File | Role | Status |
 |---|---|---|
 | `scripts/yoloe_sam2_dinov2_module.py` | Pipeline A production pipeline | **ACTIVE** |
-| `scripts/sam3_dinov2_module.py` | Pipeline B production pipeline (canvas-composite few-shot + combined-score gate) | **ACTIVE — integrated into app.py; smoke-tested only, full mAP eval pending** |
+| `scripts/sam3_dinov2_module.py` | Pipeline B production pipeline (canvas-composite few-shot + combined-score gate) | **ACTIVE — full ablation done 2026-11-07 (docs/ablation.md): best recall/mAP, lower precision than A** |
 | `app.py` | Gradio UI, both pipelines | **ACTIVE** |
 | `scripts/extract_crops_labelled.py` | Seed crop extraction (clustered) | FINALIZED |
 | `scripts/extract_crops_varied.py` | Seed crop extraction (all) | FINALIZED |
@@ -103,7 +104,7 @@ Used across multiple industrial computer vision projects.
 | SAM2 | Masked crop producer (not proposer) | `facebook/sam2.1-hiera-base-plus` | **CONFIRMED** for masking — failed as auto-proposer |
 | DINOv2 | Embedding + cosine sim scoring | `facebook/dinov2-base` | **CONFIRMED** — masked patch pooling (normal) + CLS (small) |
 | SAM3 | Region proposal (unprompted auto-mask) | `facebook/sam3` | Failed — same issue as SAM2 |
-| SAM3 | Cross-image few-shot (canvas-composite exemplar, `scripts/sam3_dinov2_module.py`) | `facebook/sam3` | **CONFIRMED working end-to-end, integrated as Pipeline B** in `app.py` (2026-07-14). No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Order: combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) first, then containment + duplicate suppression. SAM3 also box-prompted (single-image, own GT box) on ref crops to get masks for DINOv2 scoring — reuses the already-loaded SAM3 instead of a separate SAM2 phase, own-image box-prompt is a different mode from the failed unprompted auto-mask row above. All calibrated 2026-07-20; smoke-tested only, full mAP eval pending. |
+| SAM3 | Cross-image few-shot (canvas-composite exemplar, `scripts/sam3_dinov2_module.py`) | `facebook/sam3` | **CONFIRMED working end-to-end, integrated as Pipeline B** in `app.py` (2026-07-14). No native cross-image exemplar API (confirmed via SAM3 own docs/notebooks — strictly single-video/single-image, no few-shot) — ref + target composited onto one canvas, ref bbox remapped to canvas coords, box-only exemplar prompt (no text). Gated model, requires HF auth. Order: combined-score gate (`--sam3-dino-thresh`, default 0.2, on `0.2*sam3_score + 0.8*dino_sim`) first, then containment + duplicate suppression. SAM3 also box-prompted (single-image, own GT box) on ref crops to get masks for DINOv2 scoring — reuses the already-loaded SAM3 instead of a separate SAM2 phase, own-image box-prompt is a different mode from the failed unprompted auto-mask row above. All calibrated 2026-07-20. Full ablation 2026-11-07: beats Pipeline A on recall/mAP at every k; DINOv2 gate inactive at default 0.2 (docs/ablation.md). |
 | OWLv2 | Image-guided detection | `google/owlv2-base-patch16-ensemble` | Dead end — cannot detect large objects |
 
 Cached at `~/.cache/huggingface/hub/`. YOLOe downloaded by ultralytics on first use.

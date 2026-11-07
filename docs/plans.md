@@ -6,8 +6,9 @@ Forward-looking only. History/ablation/design → README.md + log.md.
 
 ## Next up
 
-- [ ] **k-shot sweep on 24 GB server** — `bash experiments/run_kshot.sh`: Pipeline A + B × k ∈ {15, 20, …, 50} on `data/test/`. Paste `runs/kshot/summary.md` into README §5.1.
-- [ ] **Sample previews for README** — one rerun per pipeline without `--no-preview` at the best k; replace the preliminary images in `docs/images/`.
+- [ ] **Pipeline B precision via the DINOv2 gate** — gate currently rejects nothing (lowest kept 0.27 vs 0.2). Hold out part of `data/label` as validation, sweep `--sam3-dino-thresh` / a `dino_sim`-only gate, report P/R/F1 vs threshold. See [ablation.md §6](ablation.md#6-implications-and-next-experiments).
+- [ ] **SAM3 exemplar selection** — typical (medoid) exemplars instead of FPS-first outliers; exemplars drawn from only k labelled instances (realistic few-shot).
+- [ ] **Hybrid per class** — B for object classes, A for forklift / no_boots / no_goggle.
 - [ ] **Containment/dup filter scaling** — O(n²) per class per target in both pipelines. Fine at current box counts; revisit if proposal counts grow.
 
 ## Research directions

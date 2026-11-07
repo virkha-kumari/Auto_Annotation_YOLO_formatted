@@ -83,7 +83,25 @@ Thresholds were calibrated during development on Construction-PPE (history in [d
 
 ## 5. Results
 
-Pending. To be filled from `runs/kshot/summary.md` after the 16 runs (2 pipelines × 8 values of *k*): mAP@.50, mAP@.50:.95, and per-phase time per run, plus per-class AP@.50.
+Construction-PPE 2026-11 release, 200 test images, 2,961 GT boxes, RTX A4000. P/R/F1 at IoU 0.50, pooled over all boxes. **Full ablation, per-class tables and raw evidence: [docs/ablation.md](docs/ablation.md).**
+
+| Run | Refs given | mAP@.50 | mAP@.5:.95 | Precision | Recall | F1 | Time / 200 img |
+|---|---|---|---|---|---|---|---|
+| A, k = 15 | 15 YOLOe refs/class | 0.517 | 0.351 | **0.704** | 0.612 | 0.655 | **34 min** |
+| A, k = 35 (best A) | 35 YOLOe refs/class | 0.542 | 0.358 | 0.656 | 0.655 | 0.655 | 63 min |
+| B, k = 15 | 5 SAM3 exemplars + 15 DINOv2 refs | 0.582 | 0.381 | 0.436 | 0.769 | 0.556 | 65 min |
+| B, k = 30 (best B k) | 5 SAM3 exemplars + 30 DINOv2 refs | 0.587 | 0.383 | 0.435 | 0.769 | 0.556 | 66 min |
+| B, 3 exemplars | 3 + bank 50 | 0.575 | 0.374 | 0.511 | 0.746 | 0.607 | 45 min |
+| B, 10 exemplars | 10 + bank 50 | **0.610** | **0.402** | 0.356 | **0.791** | 0.491 | 121 min |
+
+- **RQ1 — B (segmenter-first) wins on recall and mAP.** With 5 SAM3 exemplars it beats YOLOe given 35 references: ΔmAP@.50 +0.041, Δrecall +0.114. A keeps higher precision (−0.220 for B) and F1. For annotation, recall is the priority — missed objects are costly to recover, false positives can be filtered afterwards (DINOv2 gate, stronger embeddings, EDA review).
+- **RQ2 — scaling.** A peaks at k = 35 and its cost grows linearly with k. B is flat across k (its 5 exemplars do not change with k; the DINOv2 bank only re-scores), so **k = 15 is enough for B**. More SAM3 exemplars raise recall and mAP monotonically (3 → 5 → 10) at linear time cost; **5 is the chosen balance**.
+- **RQ3 — hard classes.** Absence classes stay weak for both (AP@.50 0.28–0.33 mean); SAM3 never finds `no_goggle`. A wins `forklift`, `no_boots`, `no_goggle`.
+
+![References given to each pipeline](docs/images/refs_gallery.png)
+![Typical test image: GT | A | B](docs/images/example_typical.png)
+
+*Typical image (Pipeline B median per-image F1, not hand-picked): green TP, red FP, dashed orange missed GT. More examples in [docs/ablation.md](docs/ablation.md#4-head-to-head-and-qualitative-examples).*
 
 ---
 
@@ -113,7 +131,8 @@ Condensed; full chronology with dates and reasons in [docs/log.md](docs/log.md).
 
 ## 7. Limitations
 
-- **Single dataset.** Thresholds were calibrated on Construction-PPE; transfer to other domains is untested.
+- **Single dataset, single run per setting.** Thresholds were calibrated on the previous Construction-PPE release and not re-tuned; transfer to other domains is untested. References for both pipelines are selected from the full labelled pool (optimistic vs. labelling only *k*). Full list in [docs/ablation.md §5](docs/ablation.md#5-threats-to-validity).
+- **Pipeline B's DINOv2 gate is inactive at the default threshold** (lowest kept score 0.27 vs gate 0.2), so B's precision is SAM3 + voting only.
 - **Score weights are empirical** (A: 0.3/0.7; B: 0.2/0.8) and not learned.
 - **Canvas aspect ratio.** Pipeline B resizes reference and target to 1008×504 each regardless of aspect ratio, which distorts shapes and halves the target's vertical resolution. This likely hurts small objects.
 - **Absence classes** (`no_*`) are structurally unsuited to exemplar matching: they are defined by a missing feature, so there is no coherent visual prototype to match.
@@ -241,6 +260,8 @@ summary.json boxes — A: {xyxy, score}; B: {box, sam3_score, dino_sim, combined
 | `scripts/eval_map.py` | P/R/F1, AP@.50, mAP@.50:.95 |
 | `app.py` | Gradio UI for both pipelines |
 | `experiments/run_kshot.sh`, `summarize_kshot.py` | k-shot sweep and result tables |
+| `experiments/make_figures.py` | Reference gallery + GT / A / B example figures (images picked by per-image F1, not by hand) |
+| `docs/ablation.md`, `docs/results/` | Ablation study and its raw evidence (per-run metrics, timing, eval output, log digest) |
 | `experiments/debug_*.py`, `test_*.py` | Development probes: per-stage visual debugging, YOLOe batching benchmark, OWLv2 dead end |
 | `docs/log.md` | Chronological ADDED / DROPPED / FINDING log |
 | `docs/plans.md` | Open tasks |

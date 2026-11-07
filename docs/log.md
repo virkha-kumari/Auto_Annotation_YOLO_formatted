@@ -7,6 +7,27 @@ Format:
 
 ---
 
+## 2026-11-07
+
+### FINDING — ablation complete: Pipeline B wins on recall/mAP, A on precision/F1
+
+18 runs (A + B × k ∈ {15..50}, B × {3, 5, 10} exemplars), 2026-11 release, 200 test images, RTX A4000, 0 skipped batches. Full study: [ablation.md](ablation.md); evidence: [results/](results/).
+- B (5 exemplars) k15 vs A k35 (A's best): ΔmAP@.50 +0.041, Δrecall +0.114, Δprecision −0.220, ΔF1 −0.099.
+- A peaks at k=35 (mAP 0.542); k50 no better; cost linear in k (34 → 80 min).
+- B flat across k (0.582–0.587): FPS gives the same first 5 exemplars at every k; DINOv2 gate rejects nothing (lowest kept 0.271 vs 0.2) → B ≈ SAM3 + voting. k=15 sufficient.
+- Exemplars 3 → 5 → 10: mAP 0.575 → 0.586 → 0.610, recall 0.746 → 0.770 → 0.791, precision 0.511 → 0.436 → 0.356, time 45 → 66 → 121 min. 5 chosen as balance.
+- `no_goggle`: SAM3 recall 0.012 at every setting. A wins forklift, no_boots, no_goggle.
+
+### ADDED — `experiments/make_figures.py`, `docs/ablation.md`, `docs/results/`
+
+GT/A/B example figures picked by per-image F1 (not by hand) + reference gallery; ablation doc; tracked per-run metrics/timing/eval + log digest (runs/ itself stays untracked).
+
+### DROPPED — old-release dataset and previews
+
+`data/` now holds only the 2026-11 release. Old `docs/images/*_preview` figures (old release) removed.
+
+---
+
 ## 2026-11-03
 
 ### FINDING — Construction-PPE zip replaced upstream
